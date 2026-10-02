@@ -437,6 +437,65 @@ track that produces no sound says where it stopped.
 `POMPMUSIC_YTDLP_MAX_ATTEMPTS` times; a failure *after* it never is, because
 restarting a track underneath its listeners is worse than letting it end.
 
+### The bot check: a PO token, never an account
+
+From a datacenter address YouTube answers with **"Sign in to confirm you're not
+a bot"** and never sends a byte of audio. The answer is a **proof-of-origin
+token**, not a login: a token proves the request came from a real client session
+without saying who anyone is.
+
+PompMusic uses [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+in **script mode** — one container, no extra port, no second Render service:
+
+```
+yt-dlp --extractor-args youtube:player_client=mweb
+       --extractor-args youtubepot-bgutilscript:server_home=/opt/bgutil-ytdlp-pot-provider/server
+         |
+         +-- pip plugin bgutil-ytdlp-pot-provider --> node <server_home>/build/generate_once.js --> BotGuard --> PO token
+```
+
+**No cookies, no browser profile, no account, no credentials.** There is nothing
+to expire, nothing to leak, and nothing tied to a person. That is a deliberate
+constraint, not an unfinished feature.
+
+The image builds the provider server from a pinned tag at build time
+(`BGUTIL_POT_VERSION`), and the plugin pip package is pinned to the same
+version. Nothing is downloaded at runtime.
+
+**Verified at startup, and never silently skipped.** Before any track plays, the
+bot checks the three things that have to be true: the script exists at
+`<server_home>/build/generate_once.js`, it runs under `node` (the same probe the
+plugin itself uses), and the pip plugin is importable by the interpreter that
+owns yt-dlp. When they hold:
+
+```
+PO token provider ready. { provider: 'bgutil', mode: 'script', ... }
+```
+
+When they do not, **streaming is switched off rather than falling back to plain
+yt-dlp** — on a blocked address that fallback cannot play anything, and the only
+symptom would be that music quietly stopped working:
+
+```
+Music stream backend unavailable [MUSIC_POT_PROVIDER_UNAVAILABLE]: <reason>
+```
+
+Every track attempt then fails with `MUSIC_POT_PROVIDER_UNAVAILABLE`, naming the
+real cause. If the provider is working and YouTube blocks anyway, the failure is
+`MUSIC_YOUTUBE_BLOCKED` instead of a generic extraction error — that is the
+signal that an account would be needed, which this project does not use.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `POMPMUSIC_POT_PROVIDER` | `none` (`bgutil-script` in the image) | `bgutil-script` enables the provider |
+| `POMPMUSIC_POT_SERVER_HOME` | `/opt/bgutil-ytdlp-pot-provider/server` | Built server; must contain `build/` and `node_modules/` |
+| `POMPMUSIC_POT_PYTHON` | `python3` | Interpreter that owns yt-dlp, for the plugin check |
+| `POMPMUSIC_YTDLP_PLAYER_CLIENT` | `mweb` | Applied only with the provider |
+
+A machine YouTube does not block needs none of this: with
+`POMPMUSIC_POT_PROVIDER=none` the command line is exactly what it was before —
+no provider arguments, no startup probes, no requirement that any of it exists.
+
 **Install it yourself; nothing is downloaded automatically.**
 
 ```bash
@@ -460,6 +519,10 @@ fallback to the extractor that is known to be broken.
 | `POMPMUSIC_YTDLP_FIRST_BYTE_TIMEOUT_MS` | `15000` | How long yt-dlp has to produce audio |
 | `POMPMUSIC_YTDLP_MAX_ATTEMPTS` | `2` | Attempts per track; `1` disables retrying |
 | `POMPMUSIC_YTDLP_RETRY_DELAY_MS` | `500` | Pause between those attempts |
+| `POMPMUSIC_POT_PROVIDER` | `none` (`bgutil-script` in the image) | PO token provider — see below |
+| `POMPMUSIC_POT_SERVER_HOME` | `/opt/bgutil-ytdlp-pot-provider/server` | Built provider server |
+| `POMPMUSIC_POT_PYTHON` | `python3` | Interpreter that owns yt-dlp |
+| `POMPMUSIC_YTDLP_PLAYER_CLIENT` | `mweb` | Used only with a provider |
 
 **No ffmpeg, no transcoding.** The format selector asks for Opus specifically,
 which YouTube serves inside WebM; Discord decodes that as-is, so the bytes go

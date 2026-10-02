@@ -178,6 +178,10 @@ export function parseEnv(env = {}, { requireDiscord = true } = {}) {
       ytdlpFirstByteTimeoutMs: flat.POMPMUSIC_YTDLP_FIRST_BYTE_TIMEOUT_MS,
       ytdlpMaxAttempts: flat.POMPMUSIC_YTDLP_MAX_ATTEMPTS,
       ytdlpRetryDelayMs: flat.POMPMUSIC_YTDLP_RETRY_DELAY_MS,
+      potProvider: flat.POMPMUSIC_POT_PROVIDER,
+      potServerHome: flat.POMPMUSIC_POT_SERVER_HOME,
+      potPython: flat.POMPMUSIC_POT_PYTHON,
+      potPlayerClient: flat.POMPMUSIC_YTDLP_PLAYER_CLIENT,
       battleSeconds: flat.POMPMUSIC_BATTLE_SECONDS,
     }),
     /**

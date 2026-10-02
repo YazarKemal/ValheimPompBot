@@ -112,10 +112,18 @@ export class YouTubeSource extends MusicSource {
    * @param {object} [options.streamBackend] Audio extraction backend (yt-dlp).
    * @param {object} [options.logger]
    */
-  constructor({ provider = null, streamBackend = null, logger = null } = {}) {
+  constructor({ provider = null, streamBackend = null, streamUnavailable = null, logger = null } = {}) {
     super({ name: YOUTUBE_SOURCE_NAME });
     this.injectedProvider = provider;
     this.streamBackend = streamBackend;
+    /**
+     * Why streaming is off, when it was turned off for a specific reason.
+     * `{ code, reason }` from the backend detection. Carried so a failed
+     * request names the real cause - a missing PO token provider is not the
+     * same failure as "no backend configured", and the operator has to be able
+     * to tell them apart from the log alone.
+     */
+    this.streamUnavailable = streamUnavailable;
     this.logger = logger;
     this.loadedProvider = null;
   }
@@ -211,6 +219,14 @@ export class YouTubeSource extends MusicSource {
     const url = resolveStreamUrl(track);
 
     if (!this.streamBackend) {
+      // The specific reason wins over the generic one. "No backend" would send
+      // an operator looking at yt-dlp when the actual problem is the provider.
+      if (this.streamUnavailable?.code) {
+        throw new BotError(
+          `Audio streaming is unavailable: ${this.streamUnavailable.reason ?? 'unknown reason'}`,
+          { code: this.streamUnavailable.code, details: { videoId: track?.id ?? null } },
+        );
+      }
       throw new BotError('No audio stream backend is configured.', { code: 'MUSIC_STREAM_FAILED' });
     }
 

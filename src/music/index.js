@@ -46,13 +46,21 @@ export function createMusicService({
   logger = createNullLogger(),
   source = null,
   providedBackend = null,
+  backendDetection = null,
   voiceFactory = createDiscordVoiceAdapter,
 }) {
   const settings = config?.music ?? {};
   // Extraction goes through yt-dlp; search still uses play-dl. The backend is
   // resolved once, so every stream in this process shares the same executable.
   const streamBackend = providedBackend ?? null;
-  const musicSource = source ?? createYouTubeSource({ logger, streamBackend });
+  // When there is no backend, the detection says whether that was ordinary (no
+  // yt-dlp) or a specific refusal (an unusable PO token provider), so a failed
+  // request reports the real cause.
+  const streamUnavailable =
+    !streamBackend && backendDetection && !backendDetection.available
+      ? { code: backendDetection.code ?? null, reason: backendDetection.reason ?? null }
+      : null;
+  const musicSource = source ?? createYouTubeSource({ logger, streamBackend, streamUnavailable });
   const sessions = createSessionManager();
   const guard = createRequestGuard({ cooldownSeconds: settings.requestCooldownSeconds });
   // Holds the candidates for a disambiguation menu between the message that

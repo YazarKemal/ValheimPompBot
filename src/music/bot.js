@@ -84,14 +84,24 @@ export async function startPompMusic({
       // The path category, not a full filesystem path.
       source: detection.source,
       format: streamBackend.format,
+      extractorArgs: streamBackend.extractorArgs ?? [],
     });
   } else {
+    // The code is logged, not just the prose: a provider that is configured but
+    // unusable must be distinguishable at a glance from a missing yt-dlp.
+    //
+    // The yt-dlp install hint only applies when yt-dlp is what is missing. On a
+    // provider failure the reason already names the fix, and telling an
+    // operator to install yt-dlp would send them the wrong way.
+    const hint = detection.code ? '' : ' Install yt-dlp and put it on PATH, or set YTDLP_PATH.';
     musicLogger.error(
-      'Music stream backend unavailable: ' +
+      'Music stream backend unavailable' +
+        (detection.code ? ` [${detection.code}]` : '') +
+        ': ' +
         (detection.reason ?? 'unknown reason') +
-        ' Install yt-dlp and put it on PATH, or set YTDLP_PATH. ' +
-        'PompMusic will run without playback; PompAI is unaffected.',
-      { backend: settings.streamBackend ?? 'ytdlp', source: detection.source },
+        hint +
+        ' PompMusic will run without playback; PompAI is unaffected.',
+      { backend: settings.streamBackend ?? 'ytdlp', source: detection.source, code: detection.code ?? null },
     );
   }
 
@@ -101,6 +111,7 @@ export async function startPompMusic({
     logger: musicLogger,
     source,
     providedBackend: streamBackend,
+    backendDetection: detection,
   });
   const commands = await loadCommands(undefined, { owner: 'pompmusic' });
 

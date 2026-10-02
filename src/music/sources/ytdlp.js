@@ -3,6 +3,7 @@ import { PassThrough } from 'node:stream';
 import { StreamType } from '@discordjs/voice';
 import { BotError, safeErrorDetails } from '../../utils/errors.js';
 import { sanitizeStderr } from '../../utils/redact.js';
+import { buildExtractorArgs, verifyPotProvider } from './pot-provider.js';
 
 /**
  * yt-dlp streaming backend.
@@ -74,6 +75,26 @@ export const DEFAULT_RETRY_DELAY_MS = 500;
 
 /** Exit codes and messages that mean "no usable audio", not a crash. */
 const NO_AUDIO_PATTERNS = [/requested format not available/i, /no video formats found/i, /requested format is not/i];
+
+/**
+ * Messages that mean YouTube refused the request, not that the track is bad.
+ *
+ * These are the ones a PO token provider exists to fix, so they get their own
+ * code: "the extraction failed" and "YouTube is blocking this address" need
+ * different responses, and only the second one is worth a token.
+ */
+const YOUTUBE_BLOCKED_PATTERNS = [
+  /sign in to confirm you'?re not a bot/i,
+  /confirm you'?re not a bot/i,
+  /sign in to confirm your age/i,
+  /bot check/i,
+];
+
+/** True when stderr describes YouTube refusing the request itself. */
+export function isYoutubeBlocked(stderr) {
+  const text = String(stderr ?? '');
+  return YOUTUBE_BLOCKED_PATTERNS.some((pattern) => pattern.test(text));
+}
 
 /**
  * Failures worth another attempt.
@@ -206,7 +227,7 @@ function probe(executable, { spawnImpl, timeoutMs }) {
  * @param {{ url: string, format?: string }} options
  * @returns {string[]}
  */
-export function buildArguments({ url, format = DEFAULT_FORMAT }) {
+export function buildArguments({ url, format = DEFAULT_FORMAT, extractorArgs = [] }) {
   return [
     // Ignore any user-level config, so behaviour does not vary by machine.
     '--ignore-config',
@@ -220,6 +241,10 @@ export function buildArguments({ url, format = DEFAULT_FORMAT }) {
     '-',
     '--format',
     format,
+    // Provider configuration, when one is enabled. Each entry is one
+    // `extractor:key=value` string, exactly as yt-dlp documents it. Nothing is
+    // added here by default: a plain yt-dlp run is unchanged.
+    ...extractorArgs.flatMap((value) => ['--extractor-args', value]),
     url,
   ];
 }
@@ -248,6 +273,7 @@ export class YtDlpStreamBackend {
     firstByteTimeoutMs = DEFAULT_FIRST_BYTE_TIMEOUT_MS,
     maxAttempts = DEFAULT_MAX_ATTEMPTS,
     retryDelayMs = DEFAULT_RETRY_DELAY_MS,
+    extractorArgs = [],
     logger = null,
   }) {
     this.name = YTDLP_BACKEND_NAME;
@@ -260,6 +286,8 @@ export class YtDlpStreamBackend {
     this.firstByteTimeoutMs = firstByteTimeoutMs;
     this.maxAttempts = maxAttempts;
     this.retryDelayMs = retryDelayMs;
+    /** Provider arguments, fixed at construction. Empty means a plain run. */
+    this.extractorArgs = Object.freeze([...extractorArgs]);
     this.logger = logger;
   }
 
@@ -318,7 +346,7 @@ export class YtDlpStreamBackend {
    * @param {{ startedAt: number, attempt: number, attempts: number }} context
    */
   async #openAttempt(url, { startedAt, attempt, attempts }) {
-    const args = buildArguments({ url, format: this.format });
+    const args = buildArguments({ url, format: this.format, extractorArgs: this.extractorArgs });
 
     let child;
     try {
@@ -532,13 +560,21 @@ export class YtDlpStreamBackend {
     // nothing to hand over: "no audio", not "crashed".
     const noAudio = patternMatch || diagnostics.code === 0;
 
-    return new BotError(
-      noAudio ? 'yt-dlp produced no playable audio for this track.' : 'yt-dlp exited before producing any audio.',
-      {
-        code: noAudio ? 'MUSIC_YTDLP_NO_AUDIO' : 'MUSIC_YTDLP_EXITED',
-        details: this.#stderrDetails(diagnostics),
-      },
-    );
+    // Checked first, and deliberately: "YouTube refused this request" is not
+    // the same failure as "this track has no audio", and only one of them is
+    // answered by a PO token.
+    const blocked = isYoutubeBlocked(stderr);
+
+    const message = blocked
+      ? 'YouTube refused the extraction (bot check). A PO token provider is required for this address.'
+      : noAudio
+        ? 'yt-dlp produced no playable audio for this track.'
+        : 'yt-dlp exited before producing any audio.';
+
+    return new BotError(message, {
+      code: blocked ? 'MUSIC_YOUTUBE_BLOCKED' : noAudio ? 'MUSIC_YTDLP_NO_AUDIO' : 'MUSIC_YTDLP_EXITED',
+      details: this.#stderrDetails(diagnostics),
+    });
   }
 
   /** Resolves on 'spawn', rejects on 'error' or a timeout. */
@@ -632,6 +668,49 @@ export async function createStreamBackend({ settings = {}, logger = null, spawnI
     return { backend: null, detection };
   }
 
+  // A configured PO token provider is verified before anything else, and a
+  // provider that does not work disables streaming outright. Falling back to
+  // plain yt-dlp here is exactly the silent failure this feature exists to
+  // remove: on a blocked address the fallback cannot play anything, and the
+  // only difference the operator would see is that it stopped working.
+  const pot = await verifyPotProvider({
+    provider: settings.potProvider,
+    serverHome: settings.potServerHome,
+    pythonPath: settings.potPython,
+    spawnImpl,
+    timeoutMs: settings.potCheckTimeoutMs,
+  });
+
+  detection.potProvider = pot;
+
+  if (!pot.ok) {
+    logger?.error?.('PO token provider unavailable: ' + pot.reason, {
+      code: pot.code,
+      // `provider` and `mode` name the provider itself, so the same two values
+      // appear whether it worked or not; the raw setting is kept separately.
+      provider: 'bgutil',
+      mode: pot.details.mode,
+      configuredAs: pot.details.provider,
+      serverHome: pot.details.serverHome,
+      pluginModule: pot.details.pluginModule,
+    });
+    return {
+      backend: null,
+      detection: { ...detection, available: false, code: pot.code, reason: pot.reason },
+    };
+  }
+
+  if (pot.enabled) {
+    logger?.info?.('PO token provider ready.', {
+      provider: 'bgutil',
+      mode: pot.details.mode,
+      serverHome: pot.details.serverHome,
+      scriptVersion: pot.details.scriptVersion,
+      pluginModule: pot.details.pluginModule,
+      playerClient: settings.potPlayerClient,
+    });
+  }
+
   return {
     backend: new YtDlpStreamBackend({
       executable: detection.path,
@@ -642,6 +721,11 @@ export async function createStreamBackend({ settings = {}, logger = null, spawnI
       firstByteTimeoutMs: settings.ytdlpFirstByteTimeoutMs,
       maxAttempts: settings.ytdlpMaxAttempts,
       retryDelayMs: settings.ytdlpRetryDelayMs,
+      extractorArgs: buildExtractorArgs({
+        provider: settings.potProvider,
+        serverHome: settings.potServerHome,
+        playerClient: settings.potPlayerClient,
+      }),
       logger,
     }),
     detection,

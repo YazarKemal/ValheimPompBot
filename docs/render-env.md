@@ -36,6 +36,10 @@ A **separate Discord application**. Never reuse PompAI's credentials.
 | `POMPMUSIC_YTDLP_FIRST_BYTE_TIMEOUT_MS` | no | `15000` | How long yt-dlp has to produce audio. Silence past this is a failed track, not a playing one. |
 | `POMPMUSIC_YTDLP_MAX_ATTEMPTS` | no | `2` | Attempts per track. Only failures before the first audio byte are retried. |
 | `POMPMUSIC_YTDLP_RETRY_DELAY_MS` | no | `500` | Pause between those attempts. |
+| `POMPMUSIC_POT_PROVIDER` | no | `bgutil-script` **in the image** | Set by the Dockerfile, because Render's address is one YouTube blocks. `none` disables the provider and streams with plain yt-dlp. |
+| `POMPMUSIC_POT_SERVER_HOME` | no | `/opt/bgutil-ytdlp-pot-provider/server` | Where the image builds the provider server. Set by the Dockerfile alongside the build path, so the two cannot drift. |
+| `POMPMUSIC_POT_PYTHON` | no | `python3` | Interpreter that owns the yt-dlp install; used only to check the plugin is importable. |
+| `POMPMUSIC_YTDLP_PLAYER_CLIENT` | no | `mweb` | Only applied together with the provider — `mweb` needs a PO token or its formats are skipped. |
 | `POMPMUSIC_MAX_QUEUE_SIZE` | no | `50` | |
 | `POMPMUSIC_MAX_TRACK_MINUTES` | no | `20` | |
 | `POMPMUSIC_REQUEST_COOLDOWN_SECONDS` | no | `3` | |

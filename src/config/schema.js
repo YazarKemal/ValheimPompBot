@@ -386,6 +386,39 @@ export const ENV_SCHEMA = Object.freeze([
       Number.isFinite(value) && value >= 0 && value <= 10000 ? null : 'must be a number between 0 and 10000',
   },
   {
+    key: 'POMPMUSIC_POT_PROVIDER',
+    group: 'pompMusic',
+    type: 'enum',
+    values: ['none', 'bgutil-script'],
+    default: 'none',
+    description:
+      'YouTube PO token provider. bgutil-script is required on a datacenter address (Render) where YouTube answers "Sign in to confirm you\'re not a bot". none is correct for a local machine YouTube does not block.',
+  },
+  {
+    key: 'POMPMUSIC_POT_SERVER_HOME',
+    group: 'pompMusic',
+    type: 'string',
+    default: '/opt/bgutil-ytdlp-pot-provider/server',
+    description:
+      'Directory of the built provider server. The yt-dlp plugin runs <server_home>/build/generate_once.js, so this must contain build/ and node_modules/.',
+  },
+  {
+    key: 'POMPMUSIC_POT_PYTHON',
+    group: 'pompMusic',
+    type: 'string',
+    default: 'python3',
+    description:
+      'Interpreter that owns the yt-dlp install, used only to verify the bgutil plugin is importable. In the container yt-dlp is pip-installed, so python3 is correct.',
+  },
+  {
+    key: 'POMPMUSIC_YTDLP_PLAYER_CLIENT',
+    group: 'pompMusic',
+    type: 'string',
+    default: 'mweb',
+    description:
+      'YouTube client used when a PO token provider is enabled. mweb needs a GVS PO token, which is why this is only applied together with the provider.',
+  },
+  {
     key: 'POMPMUSIC_SEARCH_RESULTS',
     group: 'pompMusic',
     type: 'number',
