@@ -473,8 +473,16 @@ URL, and the search text never reaches the process at all. Nothing is written to
 disk (`--no-cache-dir`, output to stdout). Skip, stop, a drained queue, `/git`
 and a dropped voice connection all kill the child — one guild's skip can never
 reach another guild's process. A track that fails to open is skipped rather than
-wedging playback, and stderr is kept in a bounded buffer for diagnostics only —
-never a signed media URL.
+wedging playback.
+
+**When extraction fails, the log says why.** yt-dlp's stderr is carried on the
+error and printed by both the retry line and the final failure line, so the
+reason — `HTTP Error 403`, `Sign in to confirm you're not a bot`, `Requested
+format is not available` — is visible in a Render log rather than only the fact
+that a track failed. It is sanitized first (`utils/redact.js`): URLs lose their
+query strings, credential assignments and cookie headers are masked, labels are
+kept, and the excerpt is capped at 500 characters. A media URL's signature never
+reaches a log.
 
 ### Controls
 

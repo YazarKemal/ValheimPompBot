@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { StreamType } from '@discordjs/voice';
-import { BotError } from '../../utils/errors.js';
+import { BotError, safeErrorDetails } from '../../utils/errors.js';
+import { sanitizeStderr } from '../../utils/redact.js';
 
 /**
  * yt-dlp streaming backend.
@@ -289,6 +290,9 @@ export class YtDlpStreamBackend {
         lastError = error;
         if (!isRetryableStreamError(error) || attempt >= attempts) throw error;
 
+        // The diagnostics travel with the log, not just the message: on a
+        // machine you cannot open a shell on, stderr is the only evidence of
+        // *why* yt-dlp produced nothing.
         this.logger?.warn?.('yt-dlp produced no audio; retrying.', {
           attempt,
           attempts,
@@ -296,6 +300,7 @@ export class YtDlpStreamBackend {
           reason: error?.message,
           urlHost: hostOf(url),
           retryInMs: this.retryDelayMs,
+          ...safeErrorDetails(error),
         });
         await delay(this.retryDelayMs);
       }
@@ -439,12 +444,7 @@ export class YtDlpStreamBackend {
       gate.reject(
         new BotError(`yt-dlp produced no audio within ${this.firstByteTimeoutMs}ms.`, {
           code: 'MUSIC_YTDLP_FIRST_BYTE_TIMEOUT',
-          details: {
-            timeoutMs: this.firstByteTimeoutMs,
-            exitCode: diagnostics.code,
-            // Bounded, and stderr only - never a signed media URL.
-            stderr: diagnostics.stderr.trim().slice(0, 500) || null,
-          },
+          details: { timeoutMs: this.firstByteTimeoutMs, ...this.#stderrDetails(diagnostics) },
         }),
       );
     }, this.firstByteTimeoutMs);
@@ -504,6 +504,26 @@ export class YtDlpStreamBackend {
     };
   }
 
+  /**
+   * The stderr context that travels with a failure.
+   *
+   * One shape for every failure, so a reader does not have to know which error
+   * code carries what. `stderr` is sanitized HERE, at the point of capture:
+   * yt-dlp prints media URLs with their signatures, and raw output must not
+   * escape this module.
+   */
+  #stderrDetails(diagnostics) {
+    return {
+      exitCode: diagnostics.code,
+      signal: diagnostics.signal,
+      bytes: diagnostics.bytes,
+      stderrBytes: diagnostics.stderr.length,
+      stderrTruncated: diagnostics.truncated,
+      // Bounded and sanitized: error text survives, signed URLs do not.
+      stderr: sanitizeStderr(diagnostics.stderr),
+    };
+  }
+
   /** Builds the failure for an attempt that exited without ever writing audio. */
   #noAudioError(diagnostics) {
     const stderr = diagnostics.stderr.trim();
@@ -516,15 +536,7 @@ export class YtDlpStreamBackend {
       noAudio ? 'yt-dlp produced no playable audio for this track.' : 'yt-dlp exited before producing any audio.',
       {
         code: noAudio ? 'MUSIC_YTDLP_NO_AUDIO' : 'MUSIC_YTDLP_EXITED',
-        details: {
-          exitCode: diagnostics.code,
-          signal: diagnostics.signal,
-          bytes: diagnostics.bytes,
-          stderrBytes: diagnostics.stderr.length,
-          stderrTruncated: diagnostics.truncated,
-          // Bounded, and stderr only - never a signed media URL.
-          stderr: stderr.slice(0, 500) || null,
-        },
+        details: this.#stderrDetails(diagnostics),
       },
     );
   }
@@ -546,7 +558,10 @@ export class YtDlpStreamBackend {
           reject,
           new BotError(`yt-dlp did not start within ${this.startupTimeoutMs}ms.`, {
             code: 'MUSIC_YTDLP_TIMEOUT',
-            details: { timeoutMs: this.startupTimeoutMs },
+            details: {
+              timeoutMs: this.startupTimeoutMs,
+              ...(diagnostics ? this.#stderrDetails(diagnostics) : {}),
+            },
           }),
         );
       }, this.startupTimeoutMs);
@@ -561,6 +576,7 @@ export class YtDlpStreamBackend {
           reject,
           new BotError(`Could not start yt-dlp: ${error?.message ?? 'unknown error'}`, {
             code: error?.code === 'ENOENT' ? 'MUSIC_YTDLP_NOT_FOUND' : 'MUSIC_YTDLP_EXITED',
+            details: diagnostics ? this.#stderrDetails(diagnostics) : null,
             cause: error,
           }),
         ),

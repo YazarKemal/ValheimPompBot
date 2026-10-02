@@ -699,6 +699,56 @@ test('a retry is logged with the reason', async () => {
   assert.match(text(), /MUSIC_YTDLP_FIRST_BYTE_TIMEOUT/);
 });
 
+test('the retry log carries sanitized stderr, never the raw output', async () => {
+  const { logger, text } = createCapturingLogger({ level: 'debug' });
+  const failing = fakeChild({
+    version: null,
+    audio: null,
+    stderr:
+      "ERROR: [youtube] abc: Sign in to confirm you're not a bot\n" +
+      '  url: https://www.youtube.com/watch?v=abc&sig=SECRETSIG\n' +
+      'cookie: SID=SECRETCOOKIE; HSID=ALSOSECRET',
+  });
+  const spawnImpl = spawnRecorder([failing, fakeChild({ version: null })]);
+  const backend = new YtDlpStreamBackend({
+    executable: 'yt-dlp',
+    spawnImpl,
+    firstByteTimeoutMs: 40,
+    retryDelayMs: 0,
+    logger,
+  });
+
+  await backend.openStream(LIVE_URL);
+
+  const output = text();
+  assert.match(output, /Sign in to confirm you're not a bot/, 'the real reason is missing from the retry log');
+  assert.match(output, /sanitizedStderr/);
+  assert.ok(!output.includes('SECRETSIG'), 'a signed media URL reached the log');
+  assert.ok(!output.includes('SECRETCOOKIE'), 'a cookie value reached the log');
+  assert.ok(!output.includes('ALSOSECRET'), 'a cookie value reached the log');
+});
+
+test('a failed attempt carries the diagnostics a Render log needs', async () => {
+  const child = fakeChild({
+    version: null,
+    exitCode: 1,
+    audio: null,
+    stderr: 'ERROR: unable to download video data: HTTP Error 403: Forbidden\nurl: https://x.example.com/v?sig=SECRET',
+  });
+  const { backend } = backendWith(child);
+
+  const error = await backend.openStream(LIVE_URL).then(
+    () => null,
+    (failure) => failure,
+  );
+
+  assert.equal(error.code, 'MUSIC_YTDLP_EXITED');
+  assert.equal(error.details.exitCode, 1);
+  assert.equal(error.details.bytes, 0);
+  assert.match(error.details.stderr, /HTTP Error 403/);
+  assert.ok(!error.details.stderr.includes('SECRET'), 'a signed URL travelled inside the error');
+});
+
 /* -------------------------------------------------------------------------- */
 /* Track contract and the source                                               */
 /* -------------------------------------------------------------------------- */

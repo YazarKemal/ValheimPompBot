@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createMusicSession, createSessionManager, ENQUEUE_RESULT } from '../src/music/session.js';
 import { MusicSource, normaliseTrack } from '../src/music/source.js';
+import { BotError } from '../src/utils/errors.js';
 import { createNullLogger, createCapturingLogger } from '../src/utils/logger.js';
 
 /**
@@ -253,6 +254,52 @@ test('a voice adapter that reports nothing is still treated as started', async (
 
   assert.equal(result.started, true);
   assert.deepEqual(announced, ['a']);
+});
+
+test('a failed extraction logs why, with the credentials stripped out', async () => {
+  // The Render log said only "Failed to start a track". The reason was already
+  // captured in the error's details and was being dropped here.
+  const { logger, text } = createCapturingLogger({ level: 'debug' });
+  const source = new FakeSource();
+  source.createAudioStream = async () => {
+    throw new BotError('yt-dlp exited before producing any audio.', {
+      code: 'MUSIC_YTDLP_EXITED',
+      details: {
+        exitCode: 1,
+        signal: null,
+        bytes: 0,
+        stderrBytes: 240,
+        stderrTruncated: false,
+        stderr:
+          'ERROR: unable to download video data: HTTP Error 403: Forbidden\n' +
+          '  url: https://rr3---sn-abc.googlevideo.com/videoplayback?expire=1&sig=SECRETSIG',
+      },
+    });
+  };
+  const { session } = makeSession({ source, logger });
+
+  await session.enqueue(track('a'), { id: 'u1', name: 'Ada' });
+
+  const output = text();
+  assert.match(output, /Failed to start a track/, 'the failure was not logged at all');
+  assert.match(output, /MUSIC_YTDLP_EXITED/);
+  assert.match(output, /stage: 'stream'/, 'the stage was not reported');
+  assert.match(output, /HTTP Error 403/, 'the actual yt-dlp error is missing');
+  assert.match(output, /sanitizedStderr/, 'stderr did not reach the log');
+  assert.match(output, /exitCode: 1/);
+  assert.match(output, /stderrBytes: 240/);
+  assert.ok(!output.includes('SECRETSIG'), 'a signed media URL reached the log');
+});
+
+test('a player failure logs the player stage, not the extraction one', async () => {
+  const { logger, text } = createCapturingLogger({ level: 'debug' });
+  const voice = fakeVoice({ playOutcome: () => ({ ok: false, reason: 'idle-before-playing', status: 'idle' }) });
+  const { session } = makeSession({ voice, logger });
+
+  await session.enqueue(track('a'), { id: 'u1', name: 'Ada' });
+
+  assert.match(text(), /stage: 'player'/);
+  assert.match(text(), /MUSIC_PLAYBACK_NOT_STARTED/);
 });
 
 /* -------------------------------------------------------------------------- */

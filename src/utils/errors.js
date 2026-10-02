@@ -1,3 +1,5 @@
+import { sanitizeStderr } from './redact.js';
+
 /**
  * Base error type for the bot.
  *
@@ -23,6 +25,43 @@ export class LoadError extends BotError {
   constructor(message, options = {}) {
     super(message, { code: 'LOAD_ERROR', ...options });
   }
+}
+
+/**
+ * Diagnostic keys that are safe to log from an error's `details`.
+ *
+ * An allow-list rather than a deny-list: a field added later is dropped by
+ * default instead of leaking by default. These are the ones an audio backend
+ * fills with bounded, non-secret context.
+ */
+const SAFE_DETAIL_KEYS = Object.freeze(['exitCode', 'signal', 'bytes', 'stderrBytes', 'stderrTruncated', 'timeoutMs']);
+
+/**
+ * Extracts the loggable diagnostics from an error, sanitising the free text.
+ *
+ * `details.stderr` is a tool's raw output, so it is passed through the
+ * sanitizer here - callers cannot accidentally log it unsanitised, and they do
+ * not have to know it needs sanitising at all.
+ *
+ * @param {unknown} error
+ * @returns {Record<string, string|number|boolean>} empty when there is nothing safe
+ */
+export function safeErrorDetails(error) {
+  const details = error?.details;
+  if (!details || typeof details !== 'object') return {};
+
+  const safe = {};
+  for (const key of SAFE_DETAIL_KEYS) {
+    const value = details[key];
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      safe[key] = value;
+    }
+  }
+
+  const stderr = sanitizeStderr(details.stderr);
+  if (stderr) safe.sanitizedStderr = stderr;
+
+  return safe;
 }
 
 /**

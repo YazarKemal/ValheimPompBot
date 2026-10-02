@@ -1,5 +1,5 @@
 import { createNullLogger } from '../utils/logger.js';
-import { BotError } from '../utils/errors.js';
+import { BotError, safeErrorDetails } from '../utils/errors.js';
 import { GuildQueue, ADD_RESULT } from './queue.js';
 
 /**
@@ -227,6 +227,12 @@ export function createMusicSession({
         reason: error?.message,
         code: error?.code ?? null,
         stage,
+        // Why the extractor produced nothing. Without this the log said only
+        // that a track failed, which is not a diagnosis. The details were
+        // already captured and bounded at the point of failure; they were
+        // simply being dropped here. `safeErrorDetails` re-sanitizes rather
+        // than trusting the source, since a different backend may not.
+        ...safeErrorDetails(error),
       });
       emit('error', { stage, track: item.track, error });
       return null;
