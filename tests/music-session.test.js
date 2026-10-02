@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createMusicSession, createSessionManager } from '../src/music/session.js';
+import { createMusicSession, createSessionManager, ENQUEUE_RESULT } from '../src/music/session.js';
 import { MusicSource, normaliseTrack } from '../src/music/source.js';
 import { createNullLogger, createCapturingLogger } from '../src/utils/logger.js';
 
@@ -11,8 +11,15 @@ import { createNullLogger, createCapturingLogger } from '../src/utils/logger.js'
 
 const track = (id, overrides = {}) => normaliseTrack({ id, source: 'fake', title: `Song ${id}`, durationSeconds: 200, ...overrides });
 
-/** Records every call and lets a test trigger player events. */
-function fakeVoice({ failPlay = false } = {}) {
+/**
+ * Records every call and lets a test trigger player events.
+ *
+ * `playOutcome` stands in for what the Discord adapter reports about playback:
+ * a promise that resolves once the player reaches Playing, `{ ok: false }` when
+ * it never does, or nothing at all for an adapter that does not report - which
+ * the session must still tolerate.
+ */
+function fakeVoice({ failPlay = false, playOutcome = undefined } = {}) {
   const handlers = new Map();
   const calls = [];
   let joined = null;
@@ -28,8 +35,9 @@ function fakeVoice({ failPlay = false } = {}) {
       joined = channelId;
       calls.push({ method: 'join', channelId });
     },
-    play() {
-      calls.push({ method: 'play' });
+    play(stream, options) {
+      calls.push({ method: 'play', options });
+      return typeof playOutcome === 'function' ? playOutcome(stream, options) : playOutcome;
     },
     pause() {
       calls.push({ method: 'pause' });
@@ -93,6 +101,159 @@ function makeSession(overrides = {}) {
   });
   return { session, voice, source };
 }
+
+/* -------------------------------------------------------------------------- */
+/* Playback is announced only once it is playing                               */
+/* -------------------------------------------------------------------------- */
+
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+test('a track is announced only after the player reports playback', async () => {
+  let release;
+  const voice = fakeVoice({ playOutcome: () => new Promise((resolve) => { release = resolve; }) });
+  const { session } = makeSession({ voice });
+  const announced = [];
+  session.on('trackStart', (item) => announced.push(item.track.id));
+
+  const pending = session.enqueue(track('a'), { id: 'u1', name: 'Ada' });
+  await settle();
+
+  assert.deepEqual(announced, [], 'the track was announced before playback began');
+
+  release({ ok: true, reason: null, status: 'playing' });
+  const result = await pending;
+
+  assert.equal(result.started, true);
+  assert.deepEqual(announced, ['a']);
+});
+
+test('a track that never reaches Playing is skipped and reported, not announced', async () => {
+  const voice = fakeVoice({ playOutcome: () => ({ ok: false, reason: 'idle-before-playing', status: 'idle' }) });
+  const { session, source } = makeSession({ voice });
+  const announced = [];
+  const errors = [];
+  session.on('trackStart', (item) => announced.push(item.track.id));
+  session.on('error', (payload) => errors.push(payload));
+
+  const result = await session.enqueue(track('a'), { id: 'u1', name: 'Ada' });
+
+  assert.deepEqual(announced, [], 'a track that never played was announced as playing');
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, ENQUEUE_RESULT.START_FAILED);
+  assert.equal(result.started, false);
+  assert.equal(session.isPlaying(), false);
+  assert.deepEqual(source.streamed, ['a']);
+  assert.equal(errors.length, 1, 'the failure was not reported');
+  assert.equal(errors[0].stage, 'player');
+  assert.equal(errors[0].error.code, 'MUSIC_PLAYBACK_NOT_STARTED');
+});
+
+test('a player failure moves on to the next queued track', async () => {
+  let call = 0;
+  const voice = fakeVoice({
+    playOutcome: () => {
+      call += 1;
+      return call === 1 ? { ok: false, reason: 'idle-before-playing', status: 'idle' } : { ok: true, reason: null, status: 'playing' };
+    },
+  });
+  const { session, source } = makeSession({ voice });
+  const announced = [];
+  session.on('trackStart', (item) => announced.push(item.track.id));
+
+  await session.enqueue(track('a'), { id: 'u1', name: 'Ada' });
+  await session.enqueue(track('b'), { id: 'u1', name: 'Ada' });
+
+  assert.deepEqual(source.streamed, ['a', 'b'], 'the next track was not started too');
+  assert.deepEqual(announced, ['b'], 'only the track that played should be announced');
+});
+
+test('an idle player during startup does not skip an extra track', async () => {
+  // The player falls back to Idle while the first track is still starting. The
+  // start path owns that failure; the idle handler must not advance as well.
+  let release;
+  let call = 0;
+  const voice = fakeVoice({
+    playOutcome: () => {
+      call += 1;
+      // Only the first track stalls; the one behind it must play normally.
+      if (call > 1) return { ok: true, reason: null, status: 'playing' };
+      return new Promise((resolve) => {
+        release = resolve;
+      });
+    },
+  });
+  const { session, source } = makeSession({ voice });
+
+  const first = session.enqueue(track('a'), { id: 'u1', name: 'Ada' });
+  await settle();
+  await session.enqueue(track('b'), { id: 'u1', name: 'Ada' });
+
+  voice.emit('idle');
+  await settle();
+  assert.deepEqual(source.streamed, ['a'], 'a second stream started before the first had failed');
+
+  release({ ok: false, reason: 'idle-before-playing', status: 'idle' });
+  await first;
+  await settle();
+
+  assert.deepEqual(source.streamed, ['a', 'b'], 'the queued track was skipped twice or not at all');
+});
+
+test('a skip during startup does not announce or replay the abandoned track', async () => {
+  // Opening a stream takes as long as yt-dlp takes. A skip landing in that
+  // window must not produce two "now playing" claims, or two streams.
+  const releases = [];
+  const voice = fakeVoice({
+    playOutcome: () =>
+      new Promise((resolve) => {
+        releases.push(resolve);
+      }),
+  });
+  const { session, source } = makeSession({ voice });
+  const announced = [];
+  session.on('trackStart', (item) => announced.push(item.track.id));
+
+  // The first request is not awaited: it cannot resolve until its track either
+  // plays or is superseded, which is exactly what this test controls.
+  const first = session.enqueue(track('a'), { id: 'u1', name: 'Ada' });
+  await settle();
+  await session.enqueue(track('b'), { id: 'u1', name: 'Ada' });
+
+  const skipped = session.skip();
+  assert.equal(skipped, true);
+
+  // The abandoned track resolves now; it must stay silent.
+  releases[0]?.({ ok: true, reason: null, status: 'playing' });
+  await settle();
+  await settle();
+
+  assert.deepEqual(announced, [], 'a superseded start announced itself');
+  assert.deepEqual(source.streamed, ['a', 'b']);
+
+  releases[1]?.({ ok: true, reason: null, status: 'playing' });
+  await settle();
+
+  assert.deepEqual(announced, ['b'], 'the skipped-to track was not announced exactly once');
+
+  // The superseded request reports that its own track did not start, which is
+  // true - it simply must not be dressed up as a failure of the session.
+  const firstResult = await first;
+  assert.equal(firstResult.ok, false);
+  assert.equal(firstResult.reason, ENQUEUE_RESULT.START_FAILED);
+});
+
+test('a voice adapter that reports nothing is still treated as started', async () => {
+  // The gate lives in the Discord adapter. A different adapter must not be
+  // declared broken merely because it returns nothing.
+  const { session } = makeSession();
+  const announced = [];
+  session.on('trackStart', (item) => announced.push(item.track.id));
+
+  const result = await session.enqueue(track('a'), { id: 'u1', name: 'Ada' });
+
+  assert.equal(result.started, true);
+  assert.deepEqual(announced, ['a']);
+});
 
 /* -------------------------------------------------------------------------- */
 /* Join and play                                                               */

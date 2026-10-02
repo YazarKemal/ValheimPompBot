@@ -19,7 +19,7 @@ import { buildNowPlayingEmbed, buildControlRow } from './messages.js';
  * There is no AI anywhere in this module tree. A song name is a search query.
  */
 
-export { createMusicSession, createSessionManager } from './session.js';
+export { createMusicSession, createSessionManager, ENQUEUE_RESULT } from './session.js';
 export { createRequestGuard } from './request-guard.js';
 export { createSelectionCache, selectionKey } from './selection-cache.js';
 export { createYouTubeSource, YouTubeSource, canonicalYoutubeUrl, resolveStreamUrl } from './sources/youtube.js';

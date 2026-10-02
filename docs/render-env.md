@@ -33,6 +33,9 @@ A **separate Discord application**. Never reuse PompAI's credentials.
 | `YTDLP_PATH` | no | empty | Empty finds `yt-dlp` on `PATH`, which is where the image puts it. |
 | `POMPMUSIC_YTDLP_FORMAT` | no | `bestaudio[acodec=opus]` | Must stay Opus. |
 | `POMPMUSIC_YTDLP_STARTUP_TIMEOUT_MS` | no | `20000` | Raise it if the container is slow to start a stream. |
+| `POMPMUSIC_YTDLP_FIRST_BYTE_TIMEOUT_MS` | no | `15000` | How long yt-dlp has to produce audio. Silence past this is a failed track, not a playing one. |
+| `POMPMUSIC_YTDLP_MAX_ATTEMPTS` | no | `2` | Attempts per track. Only failures before the first audio byte are retried. |
+| `POMPMUSIC_YTDLP_RETRY_DELAY_MS` | no | `500` | Pause between those attempts. |
 | `POMPMUSIC_MAX_QUEUE_SIZE` | no | `50` | |
 | `POMPMUSIC_MAX_TRACK_MINUTES` | no | `20` | |
 | `POMPMUSIC_REQUEST_COOLDOWN_SECONDS` | no | `3` | |

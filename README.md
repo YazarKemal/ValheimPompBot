@@ -406,8 +406,29 @@ media URL out of YouTube's player response, and that format changed under it, so
 every stream failed with `Invalid URL`. Audio now comes from **yt-dlp**:
 
 ```
-track url -> spawn yt-dlp -> stdout -> @discordjs/voice
+track url -> spawn yt-dlp -> first audio byte -> stdout -> @discordjs/voice -> Playing
 ```
+
+**A spawned process is not a playing track.** yt-dlp starts happily and then
+finds out whether YouTube will actually serve it anything — which, from a
+datacenter address, it may refuse to do. So playback is gated twice:
+
+1. **yt-dlp must write a byte.** `openStream` resolves on the first byte of
+   audio on stdout, never on spawn. A process that exits first, errors, or stays
+   silent past `POMPMUSIC_YTDLP_FIRST_BYTE_TIMEOUT_MS` is a **failed track**:
+   the process is killed and the track is skipped.
+2. **The player must reach `Playing`.** Discord's player sits in `Buffering`
+   until the WebM demuxer has a header and one Opus packet. Only then is the
+   track announced — so the now-playing card cannot appear while the channel is
+   silent.
+
+Both stages are logged (`yt-dlp spawned`, `first audio byte`, `yt-dlp exited`,
+and every `Audio player state changed` / `Voice connection state changed`), so a
+track that produces no sound says where it stopped.
+
+**Retries are bounded.** A failure *before* the first byte is retried up to
+`POMPMUSIC_YTDLP_MAX_ATTEMPTS` times; a failure *after* it never is, because
+restarting a track underneath its listeners is worse than letting it end.
 
 **Install it yourself; nothing is downloaded automatically.**
 
@@ -429,6 +450,9 @@ fallback to the extractor that is known to be broken.
 | `YTDLP_PATH` | *(empty)* | Explicit executable; empty means search `PATH` |
 | `POMPMUSIC_YTDLP_FORMAT` | `bestaudio[acodec=opus]` | Must stay Opus — see below |
 | `POMPMUSIC_YTDLP_STARTUP_TIMEOUT_MS` | `20000` | How long a spawn may take |
+| `POMPMUSIC_YTDLP_FIRST_BYTE_TIMEOUT_MS` | `15000` | How long yt-dlp has to produce audio |
+| `POMPMUSIC_YTDLP_MAX_ATTEMPTS` | `2` | Attempts per track; `1` disables retrying |
+| `POMPMUSIC_YTDLP_RETRY_DELAY_MS` | `500` | Pause between those attempts |
 
 **No ffmpeg, no transcoding.** The format selector asks for Opus specifically,
 which YouTube serves inside WebM; Discord decodes that as-is, so the bytes go

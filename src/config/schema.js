@@ -357,6 +357,35 @@ export const ENV_SCHEMA = Object.freeze([
       Number.isFinite(value) && value >= 1000 && value <= 120000 ? null : 'must be a number between 1000 and 120000',
   },
   {
+    key: 'POMPMUSIC_YTDLP_FIRST_BYTE_TIMEOUT_MS',
+    group: 'pompMusic',
+    type: 'number',
+    default: '15000',
+    description:
+      'How long yt-dlp has to produce its first audio byte. Spawning is not playing: a process that stays silent past this is abandoned and the track is skipped.',
+    validate: (value) =>
+      Number.isFinite(value) && value >= 1000 && value <= 120000 ? null : 'must be a number between 1000 and 120000',
+  },
+  {
+    key: 'POMPMUSIC_YTDLP_MAX_ATTEMPTS',
+    group: 'pompMusic',
+    type: 'number',
+    default: '2',
+    description:
+      'Attempts per track, including the first. Only failures before the first audio byte are retried; a track that has started is never restarted.',
+    validate: (value) =>
+      Number.isInteger(value) && value >= 1 && value <= 5 ? null : 'must be an integer between 1 and 5',
+  },
+  {
+    key: 'POMPMUSIC_YTDLP_RETRY_DELAY_MS',
+    group: 'pompMusic',
+    type: 'number',
+    default: '500',
+    description: 'Pause before retrying a track that produced no audio.',
+    validate: (value) =>
+      Number.isFinite(value) && value >= 0 && value <= 10000 ? null : 'must be a number between 0 and 10000',
+  },
+  {
     key: 'POMPMUSIC_SEARCH_RESULTS',
     group: 'pompMusic',
     type: 'number',

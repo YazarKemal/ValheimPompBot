@@ -1,6 +1,7 @@
 import { createNullLogger } from '../utils/logger.js';
 import { rankResults, assessConfidence } from './search.js';
 import { ADD_RESULT } from './queue.js';
+import { ENQUEUE_RESULT } from './session.js';
 import { TEXTS, buildNowPlayingEmbed, buildControlRow, buildSelectionPayload } from './messages.js';
 import { PRESENCE_TEXTS } from './presence.js';
 import { resolveMemberVoiceChannel } from './voice-state.js';
@@ -222,7 +223,9 @@ export async function enqueue(message, deps, track, logger = createNullLogger())
     const text =
       result.reason === ADD_RESULT.TOO_LONG
         ? `⏱️ Bu parça çok uzun (en fazla ${Math.round(session.queue.maxTrackSeconds / 60)} dakika).`
-        : `📛 Sıra dolu (en fazla ${session.queue.maxSize} şarkı).`;
+        : result.reason === ENQUEUE_RESULT.START_FAILED
+          ? '🔇 Bu parça başlatılamadı: ses akışı açılamadı. Sıradaki parçaya geçiliyor.'
+          : `📛 Sıra dolu (en fazla ${session.queue.maxSize} şarkı).`;
     await reply(message, text, logger);
     // The text travels back with the result so a caller that answers through an
     // interaction can reply with it rather than inventing its own message.

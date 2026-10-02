@@ -175,6 +175,9 @@ export function parseEnv(env = {}, { requireDiscord = true } = {}) {
       ytdlpPath: flat.YTDLP_PATH || null,
       ytdlpFormat: flat.POMPMUSIC_YTDLP_FORMAT,
       ytdlpStartupTimeoutMs: flat.POMPMUSIC_YTDLP_STARTUP_TIMEOUT_MS,
+      ytdlpFirstByteTimeoutMs: flat.POMPMUSIC_YTDLP_FIRST_BYTE_TIMEOUT_MS,
+      ytdlpMaxAttempts: flat.POMPMUSIC_YTDLP_MAX_ATTEMPTS,
+      ytdlpRetryDelayMs: flat.POMPMUSIC_YTDLP_RETRY_DELAY_MS,
       battleSeconds: flat.POMPMUSIC_BATTLE_SECONDS,
     }),
     /**

@@ -30,6 +30,9 @@ const LIVE_URL = `https://www.youtube.com/watch?v=${LIVE_ID}`;
 
 const enoent = () => Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' });
 
+/** Stand-in for the first bytes yt-dlp would write to stdout. */
+const AUDIO_BYTES = Buffer.from('1a45dfa3-webm-opus-audio');
+
 /**
  * A child process double.
  *
@@ -38,13 +41,20 @@ const enoent = () => Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }
  * tick it announces itself, and code that attaches listeners after awaiting
  * `openStream` depends on that ordering.
  *
+ * A stream child that is expected to succeed writes audio by default, because
+ * `openStream` no longer resolves without it. Tests about silence pass
+ * `audio: null`; tests about failure set an exit code, which suppresses the
+ * default bytes so the child really does exit without producing anything.
+ *
  * @param {object} [options]
  * @param {string|null} [options.version] Emit this on stdout and exit 0 (a probe).
  * @param {number|null} [options.exitCode] Exit after spawn (a stream child).
  * @param {string} [options.stderr]
+ * @param {Buffer|null} [options.audio] Bytes to write to stdout. Defaults to a
+ *   chunk for a stream child that is neither failing nor exiting immediately.
  * @param {Error|null} [options.failSpawn]
  */
-function fakeChild({ version = '2026.01.01', exitCode = null, stderr = '', failSpawn = null } = {}) {
+function fakeChild({ version = '2026.01.01', exitCode = null, stderr = '', audio, failSpawn = null } = {}) {
   const child = new EventEmitter();
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
@@ -56,23 +66,38 @@ function fakeChild({ version = '2026.01.01', exitCode = null, stderr = '', failS
     return true;
   };
 
-  setImmediate(() => {
-    if (failSpawn) {
-      child.emit('error', failSpawn);
-      return;
-    }
-    child.emit('spawn');
+  const isStreamChild = version === null;
+  const silentByDesign = Boolean(failSpawn) || exitCode !== null;
+  const audioBytes = audio === undefined ? (isStreamChild && !silentByDesign ? AUDIO_BYTES : null) : audio;
 
+  // Started when the recorder hands the child out, not when it is constructed.
+  // A retry reuses the same scripted list, and a child that had already emitted
+  // 'spawn' before its attempt began would otherwise never be seen to start.
+  child.start = () =>
     setImmediate(() => {
-      if (version !== null) {
-        child.stdout.write(`${version}\n`);
-        child.stdout.end();
+      if (failSpawn) {
+        child.emit('error', failSpawn);
+        return;
       }
-      if (stderr) child.stderr.write(stderr);
-      const code = version !== null ? 0 : exitCode;
-      if (code !== null) child.emit('close', code, null);
+      child.emit('spawn');
+
+      setImmediate(() => {
+        if (version !== null) {
+          child.stdout.write(`${version}\n`);
+          child.stdout.end();
+        } else if (audioBytes) {
+          // Deliberately not ended: a live stream stays open until the test says
+          // otherwise, which is what a real extraction looks like.
+          child.stdout.write(audioBytes);
+        }
+        if (stderr) child.stderr.write(stderr);
+        const code = version !== null ? 0 : exitCode;
+        // One turn later, so output is always delivered before the exit - the
+        // ordering a real process gives, and the reason stderr can be read from
+        // the failure it caused.
+        if (code !== null) setImmediate(() => child.emit('close', code, null));
+      });
     });
-  });
 
   return child;
 }
@@ -83,13 +108,21 @@ function spawnRecorder(children = []) {
   const queue = [...children];
   const impl = (command, args, options) => {
     calls.push({ command, args, options });
-    return queue.shift() ?? fakeChild({ version: null, failSpawn: enoent() });
+    const child = queue.shift() ?? fakeChild({ version: null, failSpawn: enoent() });
+    child.start?.();
+    return child;
   };
   impl.calls = calls;
   return impl;
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+/** Starts a child handed out by a spawnImpl that is not a recorder. */
+function serve(child) {
+  child.start?.();
+  return child;
+}
 
 /* -------------------------------------------------------------------------- */
 /* Detection                                                                   */
@@ -99,9 +132,7 @@ test('a configured path is probed first and wins', async () => {
   const calls = [];
   const spawnImpl = (command, args, options) => {
     calls.push({ command, args, options });
-    return command === '/opt/yt-dlp/yt-dlp'
-      ? fakeChild({ version: '2026.09.01' })
-      : fakeChild({ version: null, failSpawn: enoent() });
+    return serve(command === '/opt/yt-dlp/yt-dlp' ? fakeChild({ version: '2026.09.01' }) : fakeChild({ version: null, failSpawn: enoent() }));
   };
 
   const result = await detectYtDlp({ configuredPath: '/opt/yt-dlp/yt-dlp', spawnImpl });
@@ -115,9 +146,7 @@ test('a configured path is probed first and wins', async () => {
 
 test('detection falls back to yt-dlp on PATH', async () => {
   const spawnImpl = (command) =>
-    command === EXECUTABLE_CANDIDATES[0]
-      ? fakeChild({ version: '2026.03.04' })
-      : fakeChild({ version: null, failSpawn: enoent() });
+    serve(command === EXECUTABLE_CANDIDATES[0] ? fakeChild({ version: '2026.03.04' }) : fakeChild({ version: null, failSpawn: enoent() }));
 
   const result = await detectYtDlp({ spawnImpl });
 
@@ -130,7 +159,7 @@ test('detection falls back to yt-dlp.exe when the bare name is missing', async (
   const attempted = [];
   const spawnImpl = (command) => {
     attempted.push(command);
-    return command === 'yt-dlp.exe' ? fakeChild({ version: '2026.05.06' }) : fakeChild({ version: null, failSpawn: enoent() });
+    return serve(command === 'yt-dlp.exe' ? fakeChild({ version: '2026.05.06' }) : fakeChild({ version: null, failSpawn: enoent() }));
   };
 
   const result = await detectYtDlp({ spawnImpl });
@@ -142,7 +171,7 @@ test('detection falls back to yt-dlp.exe when the bare name is missing', async (
 });
 
 test('a missing yt-dlp is reported as unavailable with a reason, not thrown', async () => {
-  const result = await detectYtDlp({ spawnImpl: () => fakeChild({ version: null, failSpawn: enoent() }) });
+  const result = await detectYtDlp({ spawnImpl: () => serve(fakeChild({ version: null, failSpawn: enoent() })) });
 
   assert.equal(result.available, false);
   assert.equal(result.path, null);
@@ -189,7 +218,7 @@ test('streaming can be disabled outright', async () => {
 });
 
 test('an unavailable yt-dlp yields no backend rather than a broken one', async () => {
-  const spawnImpl = () => fakeChild({ version: null, failSpawn: enoent() });
+  const spawnImpl = () => serve(fakeChild({ version: null, failSpawn: enoent() }));
   const { backend, detection } = await createStreamBackend({ settings: { streamBackend: 'ytdlp' }, spawnImpl });
 
   assert.equal(backend, null, 'a backend was produced without yt-dlp');
@@ -253,12 +282,23 @@ test('a hostile-looking url is still just one argument', () => {
 /* Streaming                                                                   */
 /* -------------------------------------------------------------------------- */
 
-/** A backend over a scripted child. */
+/**
+ * A backend over a scripted child.
+ *
+ * One attempt by default: retrying is itself under test elsewhere, and a
+ * scripted recorder only has the children a test gave it.
+ */
 function backendWith(child, options = {}) {
   const spawnImpl = spawnRecorder([child]);
   return {
     spawnImpl,
-    backend: new YtDlpStreamBackend({ executable: 'yt-dlp', spawnImpl, logger: createNullLogger(), ...options }),
+    backend: new YtDlpStreamBackend({
+      executable: 'yt-dlp',
+      spawnImpl,
+      logger: createNullLogger(),
+      maxAttempts: 1,
+      ...options,
+    }),
   };
 }
 
@@ -300,38 +340,65 @@ test('the metadata reports the backend, format and startup time', async () => {
 });
 
 test('stderr is captured into a bounded buffer', async () => {
-  const noisy = fakeChild({ version: null, exitCode: 1, stderr: 'x'.repeat(MAX_STDERR_BYTES * 3) });
+  const noisy = fakeChild({ version: null, exitCode: 1, stderr: 'x'.repeat(MAX_STDERR_BYTES * 3), audio: null });
   const { backend } = backendWith(noisy);
-  const handle = await backend.openStream(LIVE_URL);
-  // The child will fail; the stream must be drained rather than left to throw.
-  handle.stream.on('error', () => {});
 
-  await tick();
-
-  assert.ok(
-    handle.meta.diagnostics.stderr.length <= MAX_STDERR_BYTES,
-    `stderr grew to ${handle.meta.diagnostics.stderr.length} bytes`,
+  const error = await backend.openStream(LIVE_URL).then(
+    () => null,
+    (failure) => failure,
   );
-  assert.equal(handle.meta.diagnostics.truncated, true, 'truncation was not recorded');
+
+  assert.ok(error, 'a child that produced nothing was reported as a start');
+  assert.equal(error.details.stderrTruncated, true, 'truncation was not recorded');
+  // What travels into the error is bounded far below the capture buffer.
+  assert.ok(error.details.stderr.length <= 500, `stderr in the error grew to ${error.details.stderr.length} bytes`);
 });
 
-test('a non-zero exit before any audio errors the stream', async () => {
-  const { backend } = backendWith(fakeChild({ version: null, exitCode: 1, stderr: 'ERROR: nope' }));
-  const { stream } = await backend.openStream(LIVE_URL);
+test('a non-zero exit before any audio is a startup failure', async () => {
+  const { backend } = backendWith(fakeChild({ version: null, exitCode: 1, stderr: 'ERROR: nope', audio: null }));
 
-  const error = await new Promise((resolve) => stream.once('error', resolve));
+  const error = await backend.openStream(LIVE_URL).then(
+    () => null,
+    (failure) => failure,
+  );
+
+  assert.ok(error, 'a failed extraction resolved as though it had started');
   assert.equal(error.code, 'MUSIC_YTDLP_EXITED');
   assert.equal(error.details.exitCode, 1);
+  assert.equal(error.details.bytes, 0);
 });
 
 test('an unavailable format is reported as no-audio, not as a crash', async () => {
-  const child = fakeChild({ version: null, exitCode: 1, stderr: 'ERROR: Requested format is not available' });
+  const child = fakeChild({
+    version: null,
+    exitCode: 1,
+    stderr: 'ERROR: Requested format is not available',
+    audio: null,
+  });
   const { backend } = backendWith(child);
-  const { stream } = await backend.openStream(LIVE_URL);
 
-  const error = await new Promise((resolve) => stream.once('error', resolve));
-  assert.equal(error.code, 'MUSIC_YTDLP_NO_AUDIO');
+  const error = await backend.openStream(LIVE_URL).then(
+    () => null,
+    (failure) => failure,
+  );
+
+  assert.equal(error?.code, 'MUSIC_YTDLP_NO_AUDIO');
   assert.match(error.message, /no playable audio/i);
+});
+
+test('a clean exit with no audio is a failure, not a track that ended', async () => {
+  // The silent case: yt-dlp exits 0 having written nothing. It used to look
+  // like a track that played and finished instantly.
+  const { backend } = backendWith(fakeChild({ version: null, exitCode: 0, audio: null }));
+
+  const error = await backend.openStream(LIVE_URL).then(
+    () => null,
+    (failure) => failure,
+  );
+
+  assert.equal(error?.code, 'MUSIC_YTDLP_NO_AUDIO');
+  assert.equal(error.details.exitCode, 0);
+  assert.equal(error.details.bytes, 0);
 });
 
 test('a non-zero exit AFTER audio has flowed is not an error', async () => {
@@ -377,6 +444,9 @@ test('a child that never spawns times out and is killed', async () => {
     executable: 'yt-dlp',
     spawnImpl,
     startupTimeoutMs: 40,
+    // The timeout is retryable, so a single attempt is what makes the code
+    // under test the thing that surfaces here.
+    maxAttempts: 1,
     logger: createNullLogger(),
   });
 
@@ -428,6 +498,205 @@ test('opening two streams starts two independent processes', async () => {
 
   assert.equal(first.killed, true);
   assert.equal(second.killed, false, 'killing one stream killed another');
+});
+
+/* -------------------------------------------------------------------------- */
+/* The first-byte gate                                                         */
+/* -------------------------------------------------------------------------- */
+
+test('openStream does not resolve on spawn alone', async () => {
+  // A process that spawns and then says nothing must not look like a start.
+  const silent = fakeChild({ version: null, audio: null });
+  const { backend } = backendWith(silent, { firstByteTimeoutMs: 40, maxAttempts: 1 });
+
+  const pending = backend.openStream(LIVE_URL);
+  const outcome = await Promise.race([pending.then(() => 'resolved'), tick().then(() => 'still-pending')]);
+
+  assert.equal(outcome, 'still-pending', 'a silent process was treated as a started stream');
+
+  // It does fail, just later - and the process does not outlive the attempt.
+  const error = await pending.catch((failure) => failure);
+  assert.equal(error.code, 'MUSIC_YTDLP_FIRST_BYTE_TIMEOUT');
+  assert.equal(silent.killed, true, 'the silent process was left running');
+});
+
+test('openStream resolves on the first audio byte, not before', async () => {
+  const child = fakeChild({ version: null, audio: null });
+  const { backend } = backendWith(child, { firstByteTimeoutMs: 1000, maxAttempts: 1 });
+
+  const pending = backend.openStream(LIVE_URL);
+  let settled = false;
+  void pending.then(() => {
+    settled = true;
+  });
+
+  await tick();
+  await tick();
+  assert.equal(settled, false, 'the stream resolved without any audio');
+
+  child.stdout.write(AUDIO_BYTES);
+  const handle = await pending;
+
+  assert.equal(settled, true);
+  assert.ok(handle.meta.firstByteMs >= 0, 'the first-byte time was not recorded');
+  assert.equal(handle.meta.attempt, 1);
+});
+
+test('the first audio byte is not swallowed by the gate', async () => {
+  const child = fakeChild({ version: null, audio: null });
+  const { backend } = backendWith(child, { firstByteTimeoutMs: 1000, maxAttempts: 1 });
+
+  const pending = backend.openStream(LIVE_URL);
+  await tick();
+  await tick();
+  child.stdout.write(AUDIO_BYTES);
+
+  const handle = await pending;
+  const received = [];
+  handle.stream.on('data', (chunk) => received.push(chunk));
+
+  await tick();
+  await tick();
+
+  const total = Buffer.concat(received);
+  assert.equal(total.length, AUDIO_BYTES.length, 'the audio that satisfied the gate was dropped');
+  assert.deepEqual(total, AUDIO_BYTES);
+});
+
+test('a silent process is abandoned after the first-byte timeout and killed', async () => {
+  const silent = fakeChild({ version: null, audio: null });
+  const { backend } = backendWith(silent, { firstByteTimeoutMs: 40, maxAttempts: 1, retryDelayMs: 0 });
+
+  const error = await backend.openStream(LIVE_URL).then(
+    () => null,
+    (failure) => failure,
+  );
+
+  assert.equal(error?.code, 'MUSIC_YTDLP_FIRST_BYTE_TIMEOUT');
+  assert.equal(error.details.timeoutMs, 40);
+  assert.equal(silent.killed, true, 'the stuck process was left running');
+});
+
+test('a pre-audio failure is retried, and a later attempt can succeed', async () => {
+  const silent = fakeChild({ version: null, audio: null });
+  const working = fakeChild({ version: null });
+  const spawnImpl = spawnRecorder([silent, working]);
+  const backend = new YtDlpStreamBackend({
+    executable: 'yt-dlp',
+    spawnImpl,
+    firstByteTimeoutMs: 40,
+    retryDelayMs: 0,
+    logger: createNullLogger(),
+  });
+
+  const handle = await backend.openStream(LIVE_URL);
+
+  assert.equal(spawnImpl.calls.length, 2, 'the silent attempt was not retried');
+  assert.equal(handle.meta.attempt, 2);
+  assert.equal(handle.meta.attempts, 2);
+  assert.equal(silent.killed, true, 'the failed attempt was left running');
+});
+
+test('retries are bounded by maxAttempts', async () => {
+  const spawnImpl = spawnRecorder([
+    fakeChild({ version: null, audio: null }),
+    fakeChild({ version: null, audio: null }),
+    fakeChild({ version: null, audio: null }),
+  ]);
+  const backend = new YtDlpStreamBackend({
+    executable: 'yt-dlp',
+    spawnImpl,
+    firstByteTimeoutMs: 40,
+    maxAttempts: 2,
+    retryDelayMs: 0,
+    logger: createNullLogger(),
+  });
+
+  const error = await backend.openStream(LIVE_URL).then(
+    () => null,
+    (failure) => failure,
+  );
+
+  assert.ok(error, 'a track that never produced audio resolved as a start');
+  assert.equal(spawnImpl.calls.length, 2, `yt-dlp was started ${spawnImpl.calls.length} times`);
+});
+
+test('a missing executable is not retried', async () => {
+  const spawnImpl = spawnRecorder([]);
+  const backend = new YtDlpStreamBackend({
+    executable: 'yt-dlp',
+    spawnImpl,
+    retryDelayMs: 0,
+    maxAttempts: 3,
+    logger: createNullLogger(),
+  });
+
+  await assert.rejects(
+    () => backend.openStream(LIVE_URL),
+    (error) => {
+      assert.equal(error.code, 'MUSIC_YTDLP_NOT_FOUND');
+      return true;
+    },
+  );
+  assert.equal(spawnImpl.calls.length, 1, 'a deterministic failure was retried');
+});
+
+test('a failure after audio has flowed is never retried', async () => {
+  const child = fakeChild({ version: null });
+  const spawnImpl = spawnRecorder([child]);
+  const backend = new YtDlpStreamBackend({
+    executable: 'yt-dlp',
+    spawnImpl,
+    maxAttempts: 3,
+    retryDelayMs: 0,
+    logger: createNullLogger(),
+  });
+
+  const handle = await backend.openStream(LIVE_URL);
+  const errors = [];
+  handle.stream.on('error', (error) => errors.push(error));
+
+  child.emit('close', 1, null);
+  await tick();
+
+  assert.deepEqual(errors, [], 'a mid-track failure was reported as an error');
+  assert.equal(spawnImpl.calls.length, 1, 'a track that had started was restarted');
+});
+
+test('spawn, first byte and exit are all logged', async () => {
+  const { logger, text } = createCapturingLogger({ level: 'debug' });
+  const child = fakeChild({ version: null });
+  const spawnImpl = spawnRecorder([child]);
+  const backend = new YtDlpStreamBackend({ executable: 'yt-dlp', spawnImpl, logger });
+
+  const handle = await backend.openStream(LIVE_URL);
+  child.emit('close', 0, null);
+  handle.stream.on('error', () => {});
+
+  const output = text();
+  assert.match(output, /yt-dlp spawned/);
+  assert.match(output, /first audio byte/);
+  assert.match(output, /yt-dlp exited/);
+  assert.match(output, /spawnMs/);
+  assert.match(output, /firstByteMs/);
+  assert.match(output, /bytes/);
+});
+
+test('a retry is logged with the reason', async () => {
+  const { logger, text } = createCapturingLogger({ level: 'debug' });
+  const spawnImpl = spawnRecorder([fakeChild({ version: null, audio: null }), fakeChild({ version: null })]);
+  const backend = new YtDlpStreamBackend({
+    executable: 'yt-dlp',
+    spawnImpl,
+    firstByteTimeoutMs: 40,
+    retryDelayMs: 0,
+    logger,
+  });
+
+  await backend.openStream(LIVE_URL);
+
+  assert.match(text(), /retrying/);
+  assert.match(text(), /MUSIC_YTDLP_FIRST_BYTE_TIMEOUT/);
 });
 
 /* -------------------------------------------------------------------------- */
@@ -766,7 +1035,7 @@ test('a missing backend is reported clearly and does not stop the bot', async ()
     config: musicConfig(),
     logger,
     clientFactory: fakeClient,
-    spawnImpl: () => fakeChild({ version: null, failSpawn: enoent() }),
+    spawnImpl: () => serve(fakeChild({ version: null, failSpawn: enoent() })),
   });
 
   assert.ok(bot, 'PompMusic failed to start entirely');

@@ -12,7 +12,17 @@ import { BotError } from '../../utils/errors.js';
  *
  * Shape of the work:
  *
- *   track.url (canonical) -> spawn yt-dlp -> stdout -> @discordjs/voice
+ *   track.url (canonical) -> spawn yt-dlp -> first audio byte -> stdout -> @discordjs/voice
+ *
+ * The first-byte gate:
+ *
+ *   A spawned process is NOT a playing track. yt-dlp starts, then decides
+ *   whether YouTube will serve it anything - and on a datacenter address it may
+ *   well not. `openStream` therefore does not resolve on 'spawn': it resolves
+ *   only once a byte of audio has actually reached stdout, and rejects when the
+ *   process exits, errors, or stays silent past `firstByteTimeoutMs`. A track
+ *   that produces nothing is reported as a failed track before any caller says
+ *   "now playing", which is exactly the lie this gate exists to prevent.
  *
  * Safety boundaries held here:
  *   - `spawn` with an argument ARRAY, never a shell. There is no command
@@ -46,8 +56,59 @@ export const MAX_STDERR_BYTES = 4096;
 
 export const DEFAULT_STARTUP_TIMEOUT_MS = 20000;
 
+/**
+ * How long the process has to produce its FIRST audio byte.
+ *
+ * Separate from the spawn timeout, and deliberately longer: spawning yt-dlp is
+ * fast, while extracting a URL from YouTube on a cold container is not. A
+ * process that spawns and then says nothing is the failure mode being measured.
+ */
+export const DEFAULT_FIRST_BYTE_TIMEOUT_MS = 15000;
+
+/** Attempts per track, including the first. Only pre-audio failures are retried. */
+export const DEFAULT_MAX_ATTEMPTS = 2;
+
+/** Pause between attempts. */
+export const DEFAULT_RETRY_DELAY_MS = 500;
+
 /** Exit codes and messages that mean "no usable audio", not a crash. */
 const NO_AUDIO_PATTERNS = [/requested format not available/i, /no video formats found/i, /requested format is not/i];
+
+/**
+ * Failures worth another attempt.
+ *
+ * All of them happen BEFORE any audio byte - once audio has flowed nothing is
+ * retried, so a track is never restarted underneath a listener. A missing
+ * executable is deliberately absent: it is deterministic, and respawning it
+ * only doubles the wait before the same answer.
+ */
+const RETRYABLE_CODES = new Set([
+  'MUSIC_YTDLP_TIMEOUT',
+  'MUSIC_YTDLP_FIRST_BYTE_TIMEOUT',
+  'MUSIC_YTDLP_EXITED',
+  'MUSIC_YTDLP_NO_AUDIO',
+]);
+
+/** True when an error is a pre-audio failure that another attempt might clear. */
+export function isRetryableStreamError(error) {
+  return Boolean(error) && RETRYABLE_CODES.has(error.code);
+}
+
+/** Hostname of a URL, or null. Never the full URL: those can be signed. */
+function hostOf(value) {
+  try {
+    return new URL(String(value)).hostname;
+  } catch {
+    return null;
+  }
+}
+
+/** Waits between attempts. Not unref'd: a retry in flight must be able to finish. */
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
 
 /** Candidate executables, in resolution order after an explicit path. */
 export const EXECUTABLE_CANDIDATES = Object.freeze(['yt-dlp', 'yt-dlp.exe']);
@@ -171,6 +232,9 @@ export class YtDlpStreamBackend {
    * @param {unknown} [options.streamType]
    * @param {Function} [options.spawnImpl]
    * @param {number} [options.startupTimeoutMs]
+   * @param {number} [options.firstByteTimeoutMs]
+   * @param {number} [options.maxAttempts]
+   * @param {number} [options.retryDelayMs]
    * @param {object} [options.logger]
    */
   constructor({
@@ -180,6 +244,9 @@ export class YtDlpStreamBackend {
     streamType = DEFAULT_STREAM_TYPE,
     spawnImpl = spawn,
     startupTimeoutMs = DEFAULT_STARTUP_TIMEOUT_MS,
+    firstByteTimeoutMs = DEFAULT_FIRST_BYTE_TIMEOUT_MS,
+    maxAttempts = DEFAULT_MAX_ATTEMPTS,
+    retryDelayMs = DEFAULT_RETRY_DELAY_MS,
     logger = null,
   }) {
     this.name = YTDLP_BACKEND_NAME;
@@ -189,23 +256,63 @@ export class YtDlpStreamBackend {
     this.streamType = streamType;
     this.spawnImpl = spawnImpl;
     this.startupTimeoutMs = startupTimeoutMs;
+    this.firstByteTimeoutMs = firstByteTimeoutMs;
+    this.maxAttempts = maxAttempts;
+    this.retryDelayMs = retryDelayMs;
     this.logger = logger;
   }
 
   /**
-   * Opens one audio stream.
+   * Opens one audio stream, retrying a bounded number of times.
    *
-   * Resolves once the child has actually spawned, so a missing or unrunnable
-   * executable is reported as a startup failure rather than as a broken audio
-   * stream later. A non-zero exit with no audio surfaces as an error on the
-   * returned stream, which @discordjs/voice forwards to the session's error
-   * path - the track is skipped, playback continues.
+   * Resolves only once yt-dlp has actually written audio to stdout - never on
+   * spawn. Anything that goes wrong before that first byte is retried up to
+   * `maxAttempts` times, because the common causes (a cold container, a slow
+   * YouTube handshake, one bad format negotiation) are transient. A failure
+   * after the first byte is never retried: the track is already playing, and
+   * restarting it underneath a listener would be worse than letting it end.
    *
    * @param {string} url Canonical, already validated.
    * @returns {Promise<{ stream: import('node:stream').Readable, inputType: unknown, kill: Function, meta: object }>}
+   * @throws {BotError} MUSIC_YTDLP_NOT_FOUND | MUSIC_YTDLP_TIMEOUT |
+   *   MUSIC_YTDLP_FIRST_BYTE_TIMEOUT | MUSIC_YTDLP_NO_AUDIO | MUSIC_YTDLP_EXITED
    */
   async openStream(url) {
     const startedAt = Date.now();
+    const attempts = Number.isInteger(this.maxAttempts) && this.maxAttempts > 0 ? this.maxAttempts : 1;
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        return await this.#openAttempt(url, { startedAt, attempt, attempts });
+      } catch (error) {
+        lastError = error;
+        if (!isRetryableStreamError(error) || attempt >= attempts) throw error;
+
+        this.logger?.warn?.('yt-dlp produced no audio; retrying.', {
+          attempt,
+          attempts,
+          code: error?.code ?? null,
+          reason: error?.message,
+          urlHost: hostOf(url),
+          retryInMs: this.retryDelayMs,
+        });
+        await delay(this.retryDelayMs);
+      }
+    }
+
+    // Unreachable: the loop either returns or throws. Kept so the contract is
+    // explicit rather than implied by the loop bounds.
+    throw lastError;
+  }
+
+  /**
+   * One spawn-to-first-byte attempt.
+   *
+   * @param {string} url
+   * @param {{ startedAt: number, attempt: number, attempts: number }} context
+   */
+  async #openAttempt(url, { startedAt, attempt, attempts }) {
     const args = buildArguments({ url, format: this.format });
 
     let child;
@@ -223,12 +330,50 @@ export class YtDlpStreamBackend {
       });
     }
 
-    await this.#waitForSpawn(child);
-
     const audio = new PassThrough();
-    const diagnostics = { stderr: '', truncated: false, bytes: 0, exited: false, code: null, signal: null };
+    const diagnostics = {
+      attempt,
+      attempts,
+      bytes: 0,
+      stderr: '',
+      truncated: false,
+      exited: false,
+      code: null,
+      signal: null,
+      spawnMs: null,
+      firstByteMs: null,
+      exitedMs: null,
+    };
 
+    const gate = createDeferred();
+    // The spawn-failure path rejects this first, and the rejection may never be
+    // awaited. Marking it handled here keeps that from surfacing as an
+    // unhandled rejection; `await gate.promise` below still sees the rejection.
+    gate.promise.catch(() => {});
+
+    let killed = false;
+    const kill = () => {
+      if (diagnostics.exited || killed) return false;
+      killed = true;
+      try {
+        // Terminates the process; on Windows this maps to TerminateProcess.
+        child.kill('SIGKILL');
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    // The pipe is attached BEFORE the gate's own listener, so the byte that
+    // satisfies the gate is the same byte that reaches the player. Attaching a
+    // 'data' listener first would resume the stream and drop that first chunk
+    // on the floor, which is precisely the failure this gate exists to catch.
+    child.stdout?.pipe(audio);
     child.stdout?.on('data', (chunk) => {
+      if (diagnostics.bytes === 0 && chunk.length > 0) {
+        diagnostics.firstByteMs = Date.now() - startedAt;
+        gate.resolve();
+      }
       diagnostics.bytes += chunk.length;
     });
 
@@ -243,11 +388,14 @@ export class YtDlpStreamBackend {
       diagnostics.stderr += text.slice(0, room);
     });
 
-    child.stdout?.pipe(audio);
-
+    // Pre-first-byte failures feed the gate. Once it has settled these are
+    // no-ops, and the post-gate handlers below take over.
     child.on('error', (error) => {
-      audio.destroy(
-        new BotError(`yt-dlp failed: ${error?.message ?? 'unknown error'}`, { code: 'MUSIC_YTDLP_EXITED', cause: error }),
+      gate.reject(
+        new BotError(`Could not start yt-dlp: ${error?.message ?? 'unknown error'}`, {
+          code: error?.code === 'ENOENT' ? 'MUSIC_YTDLP_NOT_FOUND' : 'MUSIC_YTDLP_EXITED',
+          cause: error,
+        }),
       );
     });
 
@@ -255,42 +403,82 @@ export class YtDlpStreamBackend {
       diagnostics.exited = true;
       diagnostics.code = code;
       diagnostics.signal = signal ?? null;
+      diagnostics.exitedMs = Date.now() - startedAt;
 
-      if (code === 0) return;
+      if (diagnostics.bytes > 0) {
+        this.logger?.info?.('yt-dlp exited.', {
+          attempt,
+          attempts,
+          exitCode: code,
+          signal: signal ?? null,
+          bytes: diagnostics.bytes,
+          playedMs: diagnostics.exitedMs,
+        });
+        return;
+      }
 
-      // A non-zero exit before any audio is a failed track. After audio has
-      // flowed it just means the stream ended; nothing to report.
-      if (diagnostics.bytes > 0) return;
-
-      const reason = diagnostics.stderr.trim();
-      const noAudio = NO_AUDIO_PATTERNS.some((pattern) => pattern.test(reason));
-
-      audio.destroy(
-        new BotError(
-          noAudio ? 'yt-dlp found no playable audio for this track.' : 'yt-dlp exited before producing audio.',
-          {
-            code: noAudio ? 'MUSIC_YTDLP_NO_AUDIO' : 'MUSIC_YTDLP_EXITED',
-            details: {
-              // Bounded, and stderr only - never a signed media URL.
-              exitCode: code,
-              signal: signal ?? null,
-              stderr: reason.slice(0, 500) || null,
-            },
-          },
-        ),
-      );
+      // Nothing ever reached stdout. That is a failed attempt whatever the exit
+      // code says - including code 0, which is the silent case that used to
+      // look like a track that ended immediately.
+      gate.reject(this.#noAudioError(diagnostics));
     });
 
-    const kill = () => {
-      if (diagnostics.exited) return false;
-      try {
-        // Terminates the process; on Windows this maps to TerminateProcess.
-        child.kill('SIGKILL');
-        return true;
-      } catch {
-        return false;
-      }
-    };
+    await this.#waitForSpawn(child, diagnostics, startedAt);
+
+    this.logger?.info?.('yt-dlp spawned.', {
+      attempt,
+      attempts,
+      pid: child.pid ?? null,
+      spawnMs: diagnostics.spawnMs,
+      format: this.format,
+      urlHost: hostOf(url),
+    });
+
+    const timer = setTimeout(() => {
+      kill();
+      gate.reject(
+        new BotError(`yt-dlp produced no audio within ${this.firstByteTimeoutMs}ms.`, {
+          code: 'MUSIC_YTDLP_FIRST_BYTE_TIMEOUT',
+          details: {
+            timeoutMs: this.firstByteTimeoutMs,
+            exitCode: diagnostics.code,
+            // Bounded, and stderr only - never a signed media URL.
+            stderr: diagnostics.stderr.trim().slice(0, 500) || null,
+          },
+        }),
+      );
+    }, this.firstByteTimeoutMs);
+    timer.unref?.();
+
+    try {
+      await gate.promise;
+    } catch (error) {
+      // Nothing will consume this stream, and it may already hold buffered
+      // audio. Killing covers the one path where the child is still alive: an
+      // 'error' after a successful spawn, which rejects the gate without
+      // necessarily ending the process.
+      kill();
+      audio.destroy();
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    this.logger?.info?.('yt-dlp produced its first audio byte.', {
+      attempt,
+      attempts,
+      firstByteMs: diagnostics.firstByteMs,
+      bytes: diagnostics.bytes,
+      format: this.format,
+    });
+
+    // Past the gate, an error is the end of a track that was playing: it is
+    // reported on the stream and never retried.
+    child.on('error', (error) => {
+      audio.destroy(
+        new BotError(`yt-dlp failed: ${error?.message ?? 'unknown error'}`, { code: 'MUSIC_YTDLP_EXITED', cause: error }),
+      );
+    });
 
     // If the child dies without ever being killed, the stream is already being
     // torn down by the close handler above.
@@ -306,14 +494,43 @@ export class YtDlpStreamBackend {
         backend: YTDLP_BACKEND_NAME,
         format: this.format,
         streamType: this.streamType,
+        // Time to openStream resolving: spawn + first audio byte.
         startupMs: Date.now() - startedAt,
+        firstByteMs: diagnostics.firstByteMs,
+        attempt,
+        attempts,
         diagnostics,
       },
     };
   }
 
+  /** Builds the failure for an attempt that exited without ever writing audio. */
+  #noAudioError(diagnostics) {
+    const stderr = diagnostics.stderr.trim();
+    const patternMatch = NO_AUDIO_PATTERNS.some((pattern) => pattern.test(stderr));
+    // A clean exit with an empty stdout means yt-dlp finished the job and had
+    // nothing to hand over: "no audio", not "crashed".
+    const noAudio = patternMatch || diagnostics.code === 0;
+
+    return new BotError(
+      noAudio ? 'yt-dlp produced no playable audio for this track.' : 'yt-dlp exited before producing any audio.',
+      {
+        code: noAudio ? 'MUSIC_YTDLP_NO_AUDIO' : 'MUSIC_YTDLP_EXITED',
+        details: {
+          exitCode: diagnostics.code,
+          signal: diagnostics.signal,
+          bytes: diagnostics.bytes,
+          stderrBytes: diagnostics.stderr.length,
+          stderrTruncated: diagnostics.truncated,
+          // Bounded, and stderr only - never a signed media URL.
+          stderr: stderr.slice(0, 500) || null,
+        },
+      },
+    );
+  }
+
   /** Resolves on 'spawn', rejects on 'error' or a timeout. */
-  #waitForSpawn(child) {
+  #waitForSpawn(child, diagnostics, startedAt) {
     return new Promise((resolve, reject) => {
       let settled = false;
       const finish = (fn, value) => {
@@ -327,12 +544,18 @@ export class YtDlpStreamBackend {
         child.kill?.();
         finish(
           reject,
-          new BotError(`yt-dlp did not start within ${this.startupTimeoutMs}ms.`, { code: 'MUSIC_YTDLP_TIMEOUT' }),
+          new BotError(`yt-dlp did not start within ${this.startupTimeoutMs}ms.`, {
+            code: 'MUSIC_YTDLP_TIMEOUT',
+            details: { timeoutMs: this.startupTimeoutMs },
+          }),
         );
       }, this.startupTimeoutMs);
       timer.unref?.();
 
-      child.on('spawn', () => finish(resolve, undefined));
+      child.on('spawn', () => {
+        if (diagnostics) diagnostics.spawnMs = Date.now() - startedAt;
+        finish(resolve, undefined);
+      });
       child.on('error', (error) =>
         finish(
           reject,
@@ -344,6 +567,26 @@ export class YtDlpStreamBackend {
       );
     });
   }
+}
+
+/** A promise plus its settle functions, which no-op once settled. */
+function createDeferred() {
+  let resolve;
+  let reject;
+  let settled = false;
+  const promise = new Promise((res, rej) => {
+    resolve = (value) => {
+      if (settled) return;
+      settled = true;
+      res(value);
+    };
+    reject = (error) => {
+      if (settled) return;
+      settled = true;
+      rej(error);
+    };
+  });
+  return { promise, resolve, reject };
 }
 
 /**
@@ -380,6 +623,9 @@ export async function createStreamBackend({ settings = {}, logger = null, spawnI
       format: settings.ytdlpFormat,
       spawnImpl,
       startupTimeoutMs: settings.ytdlpStartupTimeoutMs,
+      firstByteTimeoutMs: settings.ytdlpFirstByteTimeoutMs,
+      maxAttempts: settings.ytdlpMaxAttempts,
+      retryDelayMs: settings.ytdlpRetryDelayMs,
       logger,
     }),
     detection,

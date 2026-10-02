@@ -1,4 +1,5 @@
 import { createNullLogger } from '../utils/logger.js';
+import { BotError } from '../utils/errors.js';
 import { GuildQueue, ADD_RESULT } from './queue.js';
 
 /**
@@ -19,6 +20,27 @@ import { GuildQueue, ADD_RESULT } from './queue.js';
  */
 
 export const SESSION_EVENTS = Object.freeze(['trackStart', 'queueEmpty', 'error', 'disconnected']);
+
+/**
+ * Extra result reasons returned by `enqueue`.
+ *
+ * `START_FAILED` means the item was accepted into the queue but never reached
+ * playback - the stream produced no audio, or the player refused it. Reporting
+ * this as "playing" is exactly the false claim the first-byte gate exists to
+ * remove.
+ */
+export const ENQUEUE_RESULT = Object.freeze({
+  START_FAILED: 'start-failed',
+});
+
+/**
+ * Returned by a start that was superseded before it reached playback.
+ *
+ * Distinct from a failure and from null: an abandoned start must not be
+ * announced, must not be reported as a failed track, and must not advance the
+ * queue - the skip or stop that superseded it already did.
+ */
+const ABANDONED = Symbol('music-start-abandoned');
 
 export function createMusicSession({
   guildId,
@@ -41,6 +63,16 @@ export function createMusicSession({
   let startedAt = null;
   /** The stream currently playing, and the means to terminate its process. */
   let currentStream = null;
+  /**
+   * True between asking the voice adapter to play and the adapter reporting
+   * whether playback began. The player emits `idle` in that window when a
+   * stream turns out not to be playable, and `startItem` owns that failure -
+   * without this flag the idle handler would advance a second time and skip an
+   * extra track.
+   */
+  let starting = false;
+  /** Incremented per start attempt; an older generation is stale on sight. */
+  let startGeneration = 0;
 
   /**
    * Terminates the process behind the current stream.
@@ -56,6 +88,20 @@ export function createMusicSession({
       return stream.kill() === true;
     } catch (error) {
       logger.debug('Killing an audio stream threw.', { reason: error?.message });
+      return false;
+    }
+  }
+
+  /**
+   * Terminates a process handle this session opened but does not own anymore.
+   * Used when a start is superseded before it could take ownership.
+   */
+  function stopOwnedStream(handle) {
+    if (typeof handle?.kill !== 'function') return false;
+    try {
+      return handle.kill() === true;
+    } catch (error) {
+      logger.debug('Killing a superseded stream threw.', { reason: error?.message });
       return false;
     }
   }
@@ -97,33 +143,97 @@ export function createMusicSession({
   };
 
   /**
-   * Opens the stream for an item and hands it to the voice adapter.
-   * A failure here skips the track rather than stopping playback.
+   * Opens the stream for an item, plays it, and only then announces it.
+   *
+   * `trackStart` is emitted once playback has actually reached the player's
+   * Playing state - never when a process was merely spawned. That is what the
+   * now-playing card is hung off, so the card cannot claim a track is playing
+   * while the channel is silent.
+   *
+   * A failure at either stage skips the track rather than stopping playback.
+   *
+   * Opening a stream now takes as long as yt-dlp takes to produce audio, so a
+   * skip can land while a track is still starting. Each start carries a
+   * generation: a superseded one tears down what it opened and reports
+   * `ABANDONED`, and never announces itself over the track that replaced it.
+   *
+   * @returns {Promise<object|symbol|null>} the item, ABANDONED, or null on failure
    */
   async function startItem(item) {
     // The previous track's process is torn down before a new one starts, so a
     // skip cannot leave the old yt-dlp running alongside the new.
     killCurrentStream();
 
+    const generation = (startGeneration += 1);
+    const requestedAt = now();
+    starting = true;
+    let owned = null;
+
     try {
       const { stream, inputType, kill } = await source.createAudioStream(item.track);
+
+      if (generation !== startGeneration) {
+        // Superseded while the extractor was opening. This stream belongs to no
+        // one now, and `currentStream` is not ours to clear.
+        stopOwnedStream({ kill });
+        return ABANDONED;
+      }
+
       // Ownership of the child process travels with the stream.
-      currentStream = typeof kill === 'function' ? { kill, trackId: item.track?.id ?? null } : null;
-      voice.play(stream, { inputType });
+      owned = typeof kill === 'function' ? { kill, trackId: item.track?.id ?? null } : null;
+      currentStream = owned;
+
+      const outcome = await voice.play(stream, {
+        inputType,
+        metadata: { trackId: item.track?.id ?? null, title: item.track?.title ?? null },
+      });
+
+      if (generation !== startGeneration) {
+        // Superseded while the player was starting; the newer start owns
+        // playback now, so this one is dropped without a word.
+        if (currentStream === owned) killCurrentStream();
+        return ABANDONED;
+      }
+
+      // A voice adapter that reports nothing (a test double, or an older
+      // implementation) is treated as started: the gate belongs to the adapter,
+      // and inventing a failure here would break every other adapter.
+      if (outcome && outcome.ok === false) {
+        killCurrentStream();
+        throw new BotError(`Playback did not start (${outcome.reason ?? 'unknown'}).`, {
+          code: 'MUSIC_PLAYBACK_NOT_STARTED',
+          details: { reason: outcome.reason ?? null, status: outcome.status ?? null, playerStatus: outcome.status ?? null },
+        });
+      }
+
       startedAt = now();
+      logger.info('Track is now playing.', {
+        track: item.track?.title ?? item.track?.id ?? null,
+        videoId: item.track?.id ?? null,
+        startMs: startedAt - requestedAt,
+        playerStatus: outcome?.status ?? 'unknown',
+      });
       emit('trackStart', item);
       return item;
     } catch (error) {
-      logger.warn('Failed to open an audio stream; skipping.', {
+      // A failure after the stream opened is a player failure, not an
+      // extraction one - the distinction matters when reading a Render log.
+      const stage = error?.code === 'MUSIC_PLAYBACK_NOT_STARTED' ? 'player' : 'stream';
+      logger.warn('Failed to start a track; skipping.', {
         // The title, not just the id: logging only the id once made this look
         // like a bare id was being passed to the provider.
         track: item.track?.title ?? item.track?.id ?? null,
         videoId: item.track?.id ?? null,
         reason: error?.message,
         code: error?.code ?? null,
+        stage,
       });
-      emit('error', { stage: 'stream', track: item.track, error });
+      emit('error', { stage, track: item.track, error });
       return null;
+    } finally {
+      // Only the newest start owns the flag; an older one finishing must not
+      // declare the startup over while a newer one is still running.
+      if (generation === startGeneration) starting = false;
     }
   }
 
@@ -141,12 +251,20 @@ export function createMusicSession({
     }
 
     const started = await startItem(item);
+    // Abandoned: a newer advance is already responsible for what plays next.
+    // Recursing here would pull a second track out from under it.
+    if (started === ABANDONED) return null;
     if (!started) return advance();
     return started;
   }
 
   voice.on('idle', () => {
     if (destroyed) return;
+    // The player can fall back to Idle while a track is still being started
+    // (the resource turned out not to be playable). `startItem` is awaiting
+    // that outcome and will skip the track itself; advancing here as well
+    // would skip two.
+    if (starting) return;
     // The track finished on its own; its process has already exited, but the
     // handle must not linger and be killed later by an unrelated action.
     killCurrentStream();
@@ -174,6 +292,9 @@ export function createMusicSession({
   function destroy() {
     if (destroyed) return;
     destroyed = true;
+    // Anything still starting is superseded and must not announce itself into a
+    // session that is already gone.
+    startGeneration += 1;
     cancelIdle();
     killCurrentStream();
     try {
@@ -241,8 +362,10 @@ export function createMusicSession({
       if (!wasPlaying) {
         await voice.join(voiceChannelId);
         cancelIdle();
-        await advance();
-        // `advance` pulled the item we just added.
+        // `advance` pulled the item we just added. It returns null when nothing
+        // reached playback, which is reported rather than dressed up as a start.
+        const started = await advance();
+        if (!started) return { ok: false, reason: ENQUEUE_RESULT.START_FAILED, position: null, started: false };
         return { ok: true, reason: null, position: 0, started: true };
       }
 
@@ -259,6 +382,9 @@ export function createMusicSession({
 
     /** Stops playback and empties the queue, staying connected. */
     stop() {
+      // A start still in flight is superseded here, so a track that was opening
+      // cannot begin playing after the queue has been emptied.
+      startGeneration += 1;
       killCurrentStream();
       const cleared = queue.clear();
       queue.current = null;
@@ -370,3 +496,4 @@ export function createSessionManager() {
 }
 
 export { ADD_RESULT };
+

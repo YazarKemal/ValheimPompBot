@@ -5,7 +5,7 @@ import { handleMusicRequest, shouldHandle, matchesChannelName } from '../src/mus
 import { authorizeControl, parseControlId, parseSelectionId, isMusicControl } from '../src/music/controls.js';
 import { createRequestGuard } from '../src/music/request-guard.js';
 import { createSelectionCache } from '../src/music/selection-cache.js';
-import { createMusicSession, createSessionManager } from '../src/music/session.js';
+import { createMusicSession, createSessionManager, ENQUEUE_RESULT } from '../src/music/session.js';
 import { MusicSource, normaliseTrack } from '../src/music/source.js';
 import { CONTROL_IDS, buildSelectionId } from '../src/music/messages.js';
 import { createNullLogger } from '../src/utils/logger.js';
@@ -314,6 +314,28 @@ test('a full queue is refused with a readable notice', async () => {
 
   assert.equal(result.reason, 'queue-full');
   assert.match(textOf(overflow.sent[0]), /Sıra dolu/);
+});
+
+test('a track that could not start is reported as such, never as playing', async () => {
+  // The session reports START_FAILED when the stream produced no audio or the
+  // player never began. Saying "playing" here is the false claim the first-byte
+  // gate exists to remove.
+  const { deps } = makeDeps();
+  const candidate = message({ content: 'Vida Loca' });
+  deps.session = {
+    destroyed: false,
+    queue: { maxSize: 50, maxTrackSeconds: 1200 },
+    async enqueue() {
+      return { ok: false, reason: ENQUEUE_RESULT.START_FAILED, position: null, started: false };
+    },
+  };
+
+  const result = await handleMusicRequest(candidate, deps);
+
+  assert.equal(result.action, 'rejected');
+  assert.equal(result.reason, ENQUEUE_RESULT.START_FAILED);
+  assert.doesNotMatch(textOf(candidate.sent[0]), /Çalınıyor/);
+  assert.match(textOf(candidate.sent[0]), /başlatılamadı/);
 });
 
 /* -------------------------------------------------------------------------- */

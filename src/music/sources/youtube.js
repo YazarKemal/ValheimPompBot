@@ -197,6 +197,10 @@ export class YouTubeSource extends MusicSource {
    * when the player response format changed, and it could not be repaired from
    * this side. Search still uses it.
    *
+   * This resolves only after the backend has seen real audio bytes, so a
+   * track that YouTube refuses to serve fails here - naming the reason - rather
+   * than becoming a silent "playing" state.
+   *
    * @param {object} track
    * @returns {Promise<{ stream: import('node:stream').Readable, inputType: unknown, kill: Function, meta: object }>}
    */
@@ -233,6 +237,8 @@ export class YouTubeSource extends MusicSource {
       });
     }
 
+    // Reached only after yt-dlp wrote audio, so this line is evidence of real
+    // extraction rather than of a process having been started.
     this.logger?.info?.('Audio stream started.', {
       backend: result.meta.backend,
       trackId: track?.id ?? null,
@@ -240,6 +246,9 @@ export class YouTubeSource extends MusicSource {
       format: result.meta.format,
       streamType: result.meta.streamType,
       startupMs: result.meta.startupMs,
+      firstByteMs: result.meta.firstByteMs ?? null,
+      attempt: result.meta.attempt ?? 1,
+      attempts: result.meta.attempts ?? 1,
       // Hostname only: a signed media URL carries credentials in its query.
       urlHost: safeHostname(url),
     });
