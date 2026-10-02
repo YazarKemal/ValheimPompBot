@@ -399,6 +399,13 @@ removed from the message once a choice is made. Entries expire after
 `MUSIC_SELECTION_TIMEOUT_SECONDS` (60), are dropped when the voice session ends,
 and are capped in number so a busy channel cannot grow the process.
 
+A valid choice is **acknowledged with `deferUpdate` before any playback work**,
+and the outcome is posted with `followUp`. That is not politeness: opening a
+stream waits for yt-dlp's first audio byte (plus a bounded retry, plus the
+player reaching Playing), and Discord drops an interaction that goes
+unacknowledged for three seconds. The cache entry is still consumed before the
+first `await`, so a double click cannot enqueue twice.
+
 ### Audio: yt-dlp, not play-dl
 
 Search still uses play-dl. **Extraction does not** — play-dl 1.9.7 reads the

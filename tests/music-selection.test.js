@@ -139,7 +139,10 @@ function message({
 
 /** A select-menu interaction on a posted menu. */
 function selection({ requestId, value = '0', userId = 'u1', guildId = 'g1', channelId = 'c-muzik', voiceChannelId = 'vc1', message: postedMessage = {} } = {}) {
-  const calls = { reply: [], followUp: [], edit: [] };
+  // `order` records the interaction's own calls alongside anything a test
+  // pushes into it, which is how "acknowledged before playback work" is
+  // asserted.
+  const calls = { reply: [], followUp: [], edit: [], deferUpdate: [], order: [] };
   const interaction = {
     customId: buildSelectionId(requestId),
     values: [value],
@@ -161,6 +164,11 @@ function selection({ requestId, value = '0', userId = 'u1', guildId = 'g1', chan
     },
     isButton: () => false,
     isStringSelectMenu: () => true,
+    async deferUpdate() {
+      calls.deferUpdate.push(true);
+      calls.order.push('deferUpdate');
+      interaction.deferred = true;
+    },
     async reply(payload) {
       calls.reply.push(payload);
       interaction.replied = true;
@@ -269,8 +277,10 @@ test('the requester can select and the chosen track plays', async () => {
   const handled = await handleMusicInteraction(interaction, { music: harness.service, logger: createNullLogger() });
 
   assert.equal(handled, true);
-  assert.equal(interaction.calls.reply.length, 1);
-  assert.match(interaction.calls.reply[0].content, /Çalınıyor|Sıraya eklendi/);
+  assert.equal(interaction.calls.deferUpdate.length, 1, 'the interaction was not acknowledged');
+  assert.equal(interaction.calls.reply.length, 0, 'a deferred interaction must not reply');
+  assert.equal(interaction.calls.followUp.length, 1);
+  assert.match(interaction.calls.followUp[0].content, /Çalınıyor|Sıraya eklendi/);
 
   const session = harness.sessions.get('g1');
   assert.equal(session.queue.current.track.id, 'b', 'the wrong candidate played');
@@ -319,7 +329,7 @@ test('a selected track queues when something is already playing', async () => {
 
   const session = harness.sessions.get('g1');
   assert.equal(session.queue.size, 1, 'the second selection did not queue');
-  assert.match(interaction.calls.reply[0].content, /Sıraya eklendi/);
+  assert.match(interaction.calls.followUp[0].content, /Sıraya eklendi/);
 });
 
 test('an out-of-range candidate index is refused', async () => {
@@ -371,6 +381,170 @@ test('a failure to retire the menu does not fail the selection', async () => {
   await handleMusicInteraction(interaction, { music: harness.service, logger: createNullLogger() });
 
   assert.equal(harness.sessions.get('g1').isPlaying(), true, 'playback was lost with the menu');
+});
+
+/* -------------------------------------------------------------------------- */
+/* Acknowledging before playback                                               */
+/* -------------------------------------------------------------------------- */
+
+/** Records when the source is asked to open a stream, in the interaction's order. */
+function instrumentStreamOpen(source, order) {
+  const open = source.createAudioStream.bind(source);
+  source.createAudioStream = async (item) => {
+    order.push('createAudioStream');
+    return open(item);
+  };
+  return source;
+}
+
+test('a valid selection is acknowledged before any playback work starts', async () => {
+  const harness = makeHarness({ source: new FakeSource({ results: ambiguousResults() }) });
+  const candidate = await ambiguousRequest(harness);
+
+  const interaction = selection({ requestId: candidate.id, value: '0' });
+  instrumentStreamOpen(harness.source, interaction.calls.order);
+
+  await handleMusicInteraction(interaction, { music: harness.service, logger: createNullLogger() });
+
+  assert.equal(
+    interaction.calls.order[0],
+    'deferUpdate',
+    `playback work started before the acknowledgement: ${interaction.calls.order.join(' -> ')}`,
+  );
+  assert.equal(interaction.calls.deferUpdate.length, 1);
+  assert.equal(interaction.calls.reply.length, 0, 'a deferred interaction must not reply');
+  assert.equal(interaction.calls.followUp.length, 1, 'the result was not delivered by followUp');
+});
+
+test('a selection slower than the three-second deadline is still acknowledged', async () => {
+  const harness = makeHarness({ source: new FakeSource({ results: ambiguousResults() }) });
+  const candidate = await ambiguousRequest(harness);
+
+  // Discord drops an unacknowledged interaction after about three seconds.
+  // Opening a stream can take longer than that, and the acknowledgement must
+  // not be waiting on it.
+  const DISCORD_WINDOW_MS = 3000;
+  let deferredWhenOpened = null;
+  const source = harness.source;
+  source.createAudioStream = async (item) => {
+    deferredWhenOpened = interaction.deferred;
+    await new Promise((resolve) => setTimeout(resolve, DISCORD_WINDOW_MS + 200));
+    return { stream: { pipe() {} }, inputType: 'arbitrary', id: item.id };
+  };
+
+  const interaction = selection({ requestId: candidate.id, value: '0' });
+  const handled = handleMusicInteraction(interaction, { music: harness.service, logger: createNullLogger() });
+
+  // Well inside the window, and long before the stream opens.
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(interaction.deferred, true, 'the interaction was still unacknowledged after 200ms');
+
+  await handled;
+
+  assert.equal(deferredWhenOpened, true, 'the acknowledgement was waiting on the stream opening');
+  assert.equal(interaction.calls.followUp.length, 1, 'a slow selection never reported its outcome');
+  assert.match(interaction.calls.followUp[0].content, /Çalınıyor|Sıraya eklendi/);
+});
+
+test('a selection that fails to play after the deferral still reports the failure', async () => {
+  const harness = makeHarness({ source: new FakeSource({ results: ambiguousResults() }) });
+  const candidate = await ambiguousRequest(harness);
+
+  harness.source.createAudioStream = async () => {
+    throw new Error('extractor is down');
+  };
+
+  const interaction = selection({ requestId: candidate.id, value: '0' });
+  await handleMusicInteraction(interaction, { music: harness.service, logger: createNullLogger() });
+
+  assert.equal(interaction.calls.deferUpdate.length, 1);
+  assert.equal(interaction.calls.followUp.length, 1, 'a failed selection reported nothing');
+  assert.doesNotMatch(interaction.calls.followUp[0].content, /Çalınıyor/);
+  assert.match(interaction.calls.followUp[0].content, /başlatılamadı/);
+  assert.equal(harness.sessions.get('g1').isPlaying(), false);
+});
+
+test('an unauthorized selection is refused without consuming the menu or deferring', async () => {
+  const harness = makeHarness({ source: new FakeSource({ results: ambiguousResults() }) });
+  const candidate = await ambiguousRequest(harness);
+
+  const intruder = selection({ requestId: candidate.id, userId: 'u2', value: '0' });
+  await handleMusicInteraction(intruder, { music: harness.service, logger: createNullLogger() });
+
+  assert.equal(intruder.calls.deferUpdate.length, 0, 'a refusal deferred the interaction');
+  assert.equal(intruder.calls.reply.length, 1);
+  assert.equal(isEphemeral(intruder.calls.reply[0]), true);
+  assert.match(intruder.calls.reply[0].content, /yalnızca şarkıyı isteyen/);
+
+  // The requester's entry is still there, and still usable.
+  assert.equal(
+    harness.selections.has({ guildId: 'g1', channelId: 'c-muzik', requestId: candidate.id }),
+    true,
+    'a bystander consumed the entry',
+  );
+
+  const requester = selection({ requestId: candidate.id, value: '0' });
+  await handleMusicInteraction(requester, { music: harness.service, logger: createNullLogger() });
+  assert.equal(harness.sessions.get('g1').isPlaying(), true);
+});
+
+test('an expired selection is refused immediately and never deferred', async () => {
+  const harness = makeHarness({ source: new FakeSource({ results: ambiguousResults() }) });
+  const candidate = await ambiguousRequest(harness);
+  harness.selections.clear();
+
+  const late = selection({ requestId: candidate.id, value: '0' });
+  await handleMusicInteraction(late, { music: harness.service, logger: createNullLogger() });
+
+  assert.equal(late.calls.deferUpdate.length, 0);
+  assert.equal(isEphemeral(late.calls.reply[0]), true);
+  assert.match(late.calls.reply[0].content, /zaman aşımına uğradı/);
+});
+
+test('a double click cannot enqueue the same selection twice', async () => {
+  const harness = makeHarness({ source: new FakeSource({ results: ambiguousResults() }) });
+  const candidate = await ambiguousRequest(harness);
+
+  const first = selection({ requestId: candidate.id, value: '0' });
+  const second = selection({ requestId: candidate.id, value: '0' });
+
+  await handleMusicInteraction(first, { music: harness.service, logger: createNullLogger() });
+  await handleMusicInteraction(second, { music: harness.service, logger: createNullLogger() });
+
+  assert.equal(first.calls.deferUpdate.length, 1);
+  assert.equal(harness.source.streamed.length, 1, `the track was started ${harness.source.streamed.length} times`);
+  assert.equal(harness.sessions.get('g1').queue.size, 0, 'a second copy was queued');
+
+  // The second click finds nothing to consume, so it is refused on the spot.
+  assert.equal(second.calls.deferUpdate.length, 0);
+  assert.match(second.calls.reply[0].content, /zaman aşımına uğradı/);
+});
+
+test('two clicks racing the acknowledgement still enqueue once', async () => {
+  const harness = makeHarness({ source: new FakeSource({ results: ambiguousResults() }) });
+  const candidate = await ambiguousRequest(harness);
+
+  // Both clicks are in flight before either can finish deferring: the cache is
+  // consumed before the first await, so the second must find nothing.
+  const slowDefer = (interaction) => {
+    const defer = interaction.deferUpdate.bind(interaction);
+    interaction.deferUpdate = async () => {
+      await new Promise((resolve) => setImmediate(resolve));
+      return defer();
+    };
+    return interaction;
+  };
+
+  const first = slowDefer(selection({ requestId: candidate.id, value: '0' }));
+  const second = slowDefer(selection({ requestId: candidate.id, value: '0' }));
+
+  await Promise.all([
+    handleMusicInteraction(first, { music: harness.service, logger: createNullLogger() }),
+    handleMusicInteraction(second, { music: harness.service, logger: createNullLogger() }),
+  ]);
+
+  assert.equal(harness.source.streamed.length, 1, `the track was started ${harness.source.streamed.length} times`);
+  assert.equal(harness.sessions.get('g1').queue.size, 0, 'the race queued a second copy');
 });
 
 /* -------------------------------------------------------------------------- */
@@ -626,7 +800,8 @@ test('the duration limit is enforced on the selected track', async () => {
   const interaction = selection({ requestId: candidate.id, value: '0' });
   await handleMusicInteraction(interaction, { music: harness.service, logger: createNullLogger() });
 
-  assert.match(interaction.calls.reply[0].content, /çok uzun/);
+  // A valid selection is acknowledged first, so a refusal arrives by followUp.
+  assert.match(interaction.calls.followUp[0].content, /çok uzun/);
   assert.equal(harness.sessions.get('g1').isPlaying(), false);
 });
 
@@ -652,7 +827,7 @@ test('the queue limit is enforced on the selected track', async () => {
   const overflow = selection({ requestId: third.id, value: '0' });
   await handleMusicInteraction(overflow, { music: harness.service, logger: createNullLogger() });
 
-  assert.match(overflow.calls.reply[0].content, /Sıra dolu/);
+  assert.match(overflow.calls.followUp[0].content, /Sıra dolu/);
 });
 
 /* -------------------------------------------------------------------------- */

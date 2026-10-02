@@ -130,6 +130,12 @@ async function applyControl(action, session) {
  * The entry is consumed on success only. An unauthorized or invalid attempt
  * leaves it in place, so a bystander clicking the menu cannot destroy the
  * requester's chance to use it.
+ *
+ * A valid selection is acknowledged BEFORE any playback work. Opening a stream
+ * now waits for yt-dlp's first audio byte, plus a bounded retry, plus the
+ * player reaching Playing - far past Discord's three-second interaction
+ * deadline. Deferring first is what keeps a slow extraction from showing
+ * "Application did not respond"; the outcome is then reported with followUp.
  */
 async function handleSelection(interaction, ctx, service, logger) {
   const cache = service.selections;
@@ -167,8 +173,15 @@ async function handleSelection(interaction, ctx, service, logger) {
     return;
   }
 
-  // Consumed before playback so a double click cannot enqueue twice.
+  // Consumed before playback so a double click cannot enqueue twice, and - as
+  // the last synchronous step - before the first await, so a second click
+  // cannot slip in while this one is being acknowledged.
   cache.take(identity);
+
+  // Everything above is synchronous and local. Everything below can take as
+  // long as yt-dlp takes, so the interaction is acknowledged first.
+  await acknowledgeSelection(interaction, logger);
+
   await retireMenu(interaction, entry, logger);
 
   const chosen = entry.ranked[index].track;
@@ -195,6 +208,31 @@ async function handleSelection(interaction, ctx, service, logger) {
   } catch (error) {
     logger.warn('Could not play the selected track.', { reason: error?.message });
     await respond(interaction, '🔇 Seçilen şarkı çalınamadı.', true);
+  }
+}
+
+/**
+ * Acknowledges a component interaction without changing the message.
+ *
+ * This is the whole fix for the three-second deadline: after `deferUpdate` the
+ * interaction no longer has one, so a selection that takes thirty seconds to
+ * open a stream still answers. `respond` picks the deferral up and delivers the
+ * result through `followUp`.
+ *
+ * A failure here is not fatal. The token may already have expired, and the
+ * selection is still worth playing - the person simply will not see the reply.
+ *
+ * @returns {Promise<boolean>} whether the interaction is now deferred
+ */
+async function acknowledgeSelection(interaction, logger) {
+  if (interaction.deferred || interaction.replied) return true;
+  if (typeof interaction.deferUpdate !== 'function') return false;
+  try {
+    await interaction.deferUpdate();
+    return true;
+  } catch (error) {
+    logger?.debug?.('Could not defer the selection interaction.', { reason: error?.message });
+    return false;
   }
 }
 
