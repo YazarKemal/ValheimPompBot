@@ -414,9 +414,9 @@ export const ENV_SCHEMA = Object.freeze([
     key: 'POMPMUSIC_YTDLP_PLAYER_CLIENT',
     group: 'pompMusic',
     type: 'string',
-    default: 'mweb',
+    default: 'mweb,tv,web_safari',
     description:
-      'YouTube client used when a PO token provider is enabled. mweb needs a GVS PO token, which is why this is only applied together with the provider.',
+      'YouTube clients used when a PO token provider is enabled, in the order yt-dlp tries them. A list rather than one client, because a client can fail with LOGIN_REQUIRED before the token flow is reached. mweb needs a GVS PO token, which is why this is only applied together with the provider.',
   },
   {
     key: 'POMPMUSIC_SEARCH_RESULTS',

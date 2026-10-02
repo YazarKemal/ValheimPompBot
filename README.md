@@ -448,11 +448,27 @@ PompMusic uses [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-
 in **script mode** — one container, no extra port, no second Render service:
 
 ```
-yt-dlp --extractor-args youtube:player_client=mweb
+yt-dlp --extractor-args youtube:player_client=mweb,tv,web_safari;pot_trace=true
        --extractor-args youtubepot-bgutilscript:server_home=/opt/bgutil-ytdlp-pot-provider/server
          |
          +-- pip plugin bgutil-ytdlp-pot-provider --> node <server_home>/build/generate_once.js --> BotGuard --> PO token
 ```
+
+**Several clients, not one.** A client can fail with `LOGIN_REQUIRED` *before*
+the token flow is ever reached — in which case no token is generated and the
+provider changes nothing — so yt-dlp is given the documented fallback list and
+tries each in turn.
+
+The two `youtube:` settings share **one** `--extractor-args` value, separated by
+`;`, because yt-dlp *replaces* the value stored for an extractor key rather than
+merging into it. A second `youtube:` argument would silently discard the client
+list — a bug that looks exactly like the bot check it was meant to fix.
+
+**`pot_trace=true` is what makes the token flow observable.** yt-dlp prints the
+two lines that prove a token was obtained (`PO Token response from …`,
+`… retrieved from cache …`) at TRACE level, one below the DEBUG that `--verbose`
+reaches. Without it a token can be generated perfectly and leave no evidence at
+all — indistinguishable from the token flow never having run.
 
 **No cookies, no browser profile, no account, no credentials.** There is nothing
 to expire, nothing to leak, and nothing tied to a person. That is a deliberate
@@ -481,16 +497,36 @@ Music stream backend unavailable [MUSIC_POT_PROVIDER_UNAVAILABLE]: <reason>
 ```
 
 Every track attempt then fails with `MUSIC_POT_PROVIDER_UNAVAILABLE`, naming the
-real cause. If the provider is working and YouTube blocks anyway, the failure is
-`MUSIC_YOUTUBE_BLOCKED` instead of a generic extraction error — that is the
-signal that an account would be needed, which this project does not use.
+real cause.
+
+**Loaded is not the same as used.** Seeing the provider load proves nothing: the
+token flow can be skipped entirely. With a provider enabled, yt-dlp runs
+`--verbose` with `pot_trace=true` (messages go to stderr, never into the audio on
+stdout) and the three facts that matter are detected from its output and logged —
+and nothing else is:
+
+```
+PO Token provider loaded.      { provider: 'bgutil' }
+PO Token generation requested. { client: 'tv' }
+PO Token generation succeeded.
+```
+
+A token is never logged, and never leaves the diagnostics: the raw lines that
+carry it are masked by the sanitizer, and a test asserts a token cannot reach
+either the log or the error details. When a track fails, those three facts travel
+with it, which turns "playback is broken" into a specific answer:
+
+| What happened | Code | What it means |
+| --- | --- | --- |
+| Blocked, no token requested | `MUSIC_YOUTUBE_BLOCKED` | The client failed before the token flow — another client can fix this |
+| Blocked, token generated | `MUSIC_YOUTUBE_IP_BLOCKED` | A token *was* used and YouTube refused anyway: the address itself. **Not retried** — nothing about this bot will change the answer |
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `POMPMUSIC_POT_PROVIDER` | `none` (`bgutil-script` in the image) | `bgutil-script` enables the provider |
 | `POMPMUSIC_POT_SERVER_HOME` | `/opt/bgutil-ytdlp-pot-provider/server` | Built server; must contain `build/` and `node_modules/` |
 | `POMPMUSIC_POT_PYTHON` | `python3` | Interpreter that owns yt-dlp, for the plugin check |
-| `POMPMUSIC_YTDLP_PLAYER_CLIENT` | `mweb` | Applied only with the provider |
+| `POMPMUSIC_YTDLP_PLAYER_CLIENT` | `mweb,tv,web_safari` | Applied only with the provider |
 
 A machine YouTube does not block needs none of this: with
 `POMPMUSIC_POT_PROVIDER=none` the command line is exactly what it was before —
@@ -522,7 +558,7 @@ fallback to the extractor that is known to be broken.
 | `POMPMUSIC_POT_PROVIDER` | `none` (`bgutil-script` in the image) | PO token provider — see below |
 | `POMPMUSIC_POT_SERVER_HOME` | `/opt/bgutil-ytdlp-pot-provider/server` | Built provider server |
 | `POMPMUSIC_POT_PYTHON` | `python3` | Interpreter that owns yt-dlp |
-| `POMPMUSIC_YTDLP_PLAYER_CLIENT` | `mweb` | Used only with a provider |
+| `POMPMUSIC_YTDLP_PLAYER_CLIENT` | `mweb,tv,web_safari` | Applied only with the provider |
 
 **No ffmpeg, no transcoding.** The format selector asks for Opus specifically,
 which YouTube serves inside WebM; Discord decodes that as-is, so the bytes go

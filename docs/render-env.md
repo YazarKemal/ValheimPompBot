@@ -39,7 +39,7 @@ A **separate Discord application**. Never reuse PompAI's credentials.
 | `POMPMUSIC_POT_PROVIDER` | no | `bgutil-script` **in the image** | Set by the Dockerfile, because Render's address is one YouTube blocks. `none` disables the provider and streams with plain yt-dlp. |
 | `POMPMUSIC_POT_SERVER_HOME` | no | `/opt/bgutil-ytdlp-pot-provider/server` | Where the image builds the provider server. Set by the Dockerfile alongside the build path, so the two cannot drift. |
 | `POMPMUSIC_POT_PYTHON` | no | `python3` | Interpreter that owns the yt-dlp install; used only to check the plugin is importable. |
-| `POMPMUSIC_YTDLP_PLAYER_CLIENT` | no | `mweb` | Only applied together with the provider — `mweb` needs a PO token or its formats are skipped. |
+| `POMPMUSIC_YTDLP_PLAYER_CLIENT` | no | `mweb,tv,web_safari` | Only applied together with the provider. A list, because a client can fail with LOGIN_REQUIRED before the token flow is reached. `pot_trace=true` is passed alongside it so the token flow is visible in the log. |
 | `POMPMUSIC_MAX_QUEUE_SIZE` | no | `50` | |
 | `POMPMUSIC_MAX_TRACK_MINUTES` | no | `20` | |
 | `POMPMUSIC_REQUEST_COOLDOWN_SECONDS` | no | `3` | |

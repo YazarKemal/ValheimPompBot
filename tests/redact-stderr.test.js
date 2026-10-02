@@ -106,6 +106,32 @@ test('a PO Token label survives even when its value does not', () => {
   assert.ok(!output.includes('eyJhbGciOiJIUzI1NiJ9.long.value'));
 });
 
+test('a PO token is masked in every shape yt-dlp prints it', () => {
+  // A PO token is a credential - it is the whole reason this project does not
+  // use cookies - and yt-dlp's own debug output prints it in full.
+  const cases = [
+    "PoTokenResponse(po_token='eyJhbGciOiJIUzI1NiJ9.payload.sig', expires_at=1)",
+    'po_token=eyJhbGciOiJIUzI1NiJ9.payload.sig',
+    'po-token: eyJhbGciOiJIUzI1NiJ9.payload.sig',
+    'PO Token = "eyJhbGciOiJIUzI1NiJ9.payload.sig"',
+  ];
+
+  for (const input of cases) {
+    const output = sanitizeStderr(input);
+    assert.ok(!output.includes('eyJhbGciOiJIUzI1NiJ9'), `the token survived: ${output}`);
+    assert.match(output, /\[redacted\]/);
+  }
+});
+
+test('a PO token label with nothing after it is left alone', () => {
+  // The word is a diagnosis - "PO Token not provided" is exactly what a log
+  // needs to say - so only a value is removed.
+  assert.equal(
+    sanitizeStderr('ERROR: [youtube] PO Token not provided; some formats may be missing'),
+    'ERROR: [youtube] PO Token not provided; some formats may be missing',
+  );
+});
+
 test('a Discord-shaped token is masked wherever it appears', () => {
   // Assembled at runtime - see tests/helpers/fake-secrets.js for why.
   const token = fakeDiscordToken();

@@ -34,7 +34,22 @@ export class LoadError extends BotError {
  * default instead of leaking by default. These are the ones an audio backend
  * fills with bounded, non-secret context.
  */
-const SAFE_DETAIL_KEYS = Object.freeze(['exitCode', 'signal', 'bytes', 'stderrBytes', 'stderrTruncated', 'timeoutMs']);
+const SAFE_DETAIL_KEYS = Object.freeze([
+  'exitCode',
+  'signal',
+  'bytes',
+  'stderrBytes',
+  'stderrTruncated',
+  'timeoutMs',
+  // What the PO token flow did. Booleans and a client name: the token itself is
+  // never among them. `potAvailable` rather than `potTokenAvailable` for a
+  // reason - the logger redacts any value under a key containing "token", so
+  // the obvious name prints as [redacted].
+  'potProviderLoaded',
+  'potGenerationRequested',
+  'potAvailable',
+  'potClient',
+]);
 
 /**
  * Extracts the loggable diagnostics from an error, sanitising the free text.

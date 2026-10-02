@@ -100,6 +100,17 @@ const ASSIGNED_SECRET_PATTERN =
   /(^|[\s&?;,])((?:access[_-]?)?token|sig|signature|api[_-]?key|apikey|cookie|authorization|password|session[_-]?id|visitor[_-]?data|po[_-]?token)(\s*[:=]\s*)((?:bearer|basic)[ \t]+)?([^\s&;,)"']+)/gi;
 
 /**
+ * A PO token value, in any of the shapes it gets printed in.
+ *
+ * yt-dlp's own debug output renders one as `PoTokenResponse(po_token='eyJ...')`,
+ * which the assignment rule above cannot see: the label is preceded by `(` and
+ * the value is quoted. A token is a credential - it is the whole reason this
+ * project refuses to use cookies - so it gets its own rule rather than relying
+ * on the label happening to sit after a space.
+ */
+const PO_TOKEN_PATTERN = /(\bpo[ _-]?token\b["']?\s*[:=]\s*)['"]?[A-Za-z0-9_+/.%=-]{8,}['"]?/gi;
+
+/**
  * A whole cookie header, not just its first pair.
  *
  * `Cookie: SID=…; HSID=…` is one credential made of several, and masking only
@@ -152,6 +163,7 @@ export function sanitizeStderr(text, { maxChars = MAX_STDERR_CHARS } = {}) {
   let output = trimmed
     .replace(URL_PATTERN, stripUrlQuery)
     .replace(COOKIE_HEADER_PATTERN, `$1$2${REDACTED}`)
+    .replace(PO_TOKEN_PATTERN, `$1${REDACTED}`)
     // The scheme word ("Bearer") is kept; only the credential after it goes.
     .replace(ASSIGNED_SECRET_PATTERN, `$1$2$3$4${REDACTED}`)
     .replace(DISCORD_TOKEN_PATTERN, REDACTED);

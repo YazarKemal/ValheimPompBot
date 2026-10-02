@@ -3,7 +3,14 @@ import { PassThrough } from 'node:stream';
 import { StreamType } from '@discordjs/voice';
 import { BotError, safeErrorDetails } from '../../utils/errors.js';
 import { sanitizeStderr } from '../../utils/redact.js';
-import { buildExtractorArgs, verifyPotProvider } from './pot-provider.js';
+import {
+  buildExtractorArgs,
+  createPotDiagnostics,
+  hasPotToken,
+  potDiagnosticsSummary,
+  scanPotDiagnostics,
+  verifyPotProvider,
+} from './pot-provider.js';
 
 /**
  * yt-dlp streaming backend.
@@ -227,7 +234,7 @@ function probe(executable, { spawnImpl, timeoutMs }) {
  * @param {{ url: string, format?: string }} options
  * @returns {string[]}
  */
-export function buildArguments({ url, format = DEFAULT_FORMAT, extractorArgs = [] }) {
+export function buildArguments({ url, format = DEFAULT_FORMAT, extractorArgs = [], diagnostics = false }) {
   return [
     // Ignore any user-level config, so behaviour does not vary by machine.
     '--ignore-config',
@@ -235,7 +242,10 @@ export function buildArguments({ url, format = DEFAULT_FORMAT, extractorArgs = [
     '--no-cache-dir',
     '--no-playlist',
     '--no-progress',
-    '--no-warnings',
+    // Warnings are part of the evidence when a token is in play - "mweb client
+    // https formats require a GVS PO Token" is the clearest possible statement
+    // that no token was supplied - so only the quiet path suppresses them.
+    ...(diagnostics ? ['--verbose'] : ['--no-warnings']),
     // Audio to stdout. `-` is yt-dlp's stdout convention.
     '--output',
     '-',
@@ -274,6 +284,7 @@ export class YtDlpStreamBackend {
     maxAttempts = DEFAULT_MAX_ATTEMPTS,
     retryDelayMs = DEFAULT_RETRY_DELAY_MS,
     extractorArgs = [],
+    diagnostics = false,
     logger = null,
   }) {
     this.name = YTDLP_BACKEND_NAME;
@@ -288,6 +299,14 @@ export class YtDlpStreamBackend {
     this.retryDelayMs = retryDelayMs;
     /** Provider arguments, fixed at construction. Empty means a plain run. */
     this.extractorArgs = Object.freeze([...extractorArgs]);
+    /**
+     * Run yt-dlp verbosely and watch what the provider does.
+     *
+     * On when a PO token provider is in use: the messages that distinguish "no
+     * token was generated" from "a token was generated and YouTube still
+     * refused" are only printed then.
+     */
+    this.diagnostics = Boolean(diagnostics);
     this.logger = logger;
   }
 
@@ -346,7 +365,12 @@ export class YtDlpStreamBackend {
    * @param {{ startedAt: number, attempt: number, attempts: number }} context
    */
   async #openAttempt(url, { startedAt, attempt, attempts }) {
-    const args = buildArguments({ url, format: this.format, extractorArgs: this.extractorArgs });
+    const args = buildArguments({
+      url,
+      format: this.format,
+      extractorArgs: this.extractorArgs,
+      diagnostics: this.diagnostics,
+    });
 
     let child;
     try {
@@ -364,6 +388,10 @@ export class YtDlpStreamBackend {
     }
 
     const audio = new PassThrough();
+    // The PO token flow is only visible in stderr, and none of it is ever
+    // logged: the scanner keeps boolean facts, and the raw lines - which
+    // include the token itself - never leave this method.
+    const pot = createPotDiagnostics();
     const diagnostics = {
       attempt,
       attempts,
@@ -376,6 +404,8 @@ export class YtDlpStreamBackend {
       spawnMs: null,
       firstByteMs: null,
       exitedMs: null,
+      /** What the PO token flow did during this attempt, if anything. */
+      pot,
     };
 
     const gate = createDeferred();
@@ -411,14 +441,32 @@ export class YtDlpStreamBackend {
     });
 
     child.stderr?.on('data', (chunk) => {
-      const room = MAX_STDERR_BYTES - diagnostics.stderr.length;
-      if (room <= 0) {
-        diagnostics.truncated = true;
-        return;
-      }
       const text = String(chunk);
-      if (text.length > room) diagnostics.truncated = true;
-      diagnostics.stderr += text.slice(0, room);
+
+      for (const event of scanPotDiagnostics(text, pot)) {
+        // The three facts asked for, one line each, and nothing derived from
+        // the content that produced them.
+        const messages = {
+          providerLoaded: 'PO Token provider loaded.',
+          generationRequested: 'PO Token generation requested.',
+          tokenGenerated: 'PO Token generation succeeded.',
+          tokenFromCache: 'PO Token served from the yt-dlp cache.',
+        };
+        this.logger?.info?.(messages[event], {
+          attempt,
+          ...(event === 'providerLoaded' ? { provider: 'bgutil' } : {}),
+          ...(pot.client ? { client: pot.client } : {}),
+        });
+      }
+
+      // A TAIL, not a head. With --verbose the interesting lines are the last
+      // ones - the error is printed after the debug trace - so keeping the
+      // beginning would throw away exactly what is needed.
+      diagnostics.stderr += text;
+      if (diagnostics.stderr.length > MAX_STDERR_BYTES) {
+        diagnostics.stderr = diagnostics.stderr.slice(-MAX_STDERR_BYTES);
+        diagnostics.truncated = true;
+      }
     });
 
     // Pre-first-byte failures feed the gate. Once it has settled these are
@@ -547,6 +595,9 @@ export class YtDlpStreamBackend {
       bytes: diagnostics.bytes,
       stderrBytes: diagnostics.stderr.length,
       stderrTruncated: diagnostics.truncated,
+      // The token flow, as facts. Never the lines they came from: those carry
+      // the token, and this is the one place it could escape into a log.
+      ...potDiagnosticsSummary(diagnostics.pot),
       // Bounded and sanitized: error text survives, signed URLs do not.
       stderr: sanitizeStderr(diagnostics.stderr),
     };
@@ -565,14 +616,35 @@ export class YtDlpStreamBackend {
     // answered by a PO token.
     const blocked = isYoutubeBlocked(stderr);
 
-    const message = blocked
-      ? 'YouTube refused the extraction (bot check). A PO token provider is required for this address.'
-      : noAudio
-        ? 'yt-dlp produced no playable audio for this track.'
-        : 'yt-dlp exited before producing any audio.';
+    // The distinction that decides what to do next:
+    //
+    //   blocked, no token   -> the token flow never ran. Another client, or a
+    //                          working provider, is the answer.
+    //   blocked, with token -> a token WAS generated and YouTube refused
+    //                          anyway. That is the address itself, and no
+    //                          amount of retrying or client-changing helps.
+    //
+    // Reported separately because they look identical in a log otherwise, and
+    // the second one is not a bug in this bot.
+    const tokenAvailable = hasPotToken(diagnostics.pot);
+    const ipBlocked = blocked && tokenAvailable;
+
+    const message = ipBlocked
+      ? 'YouTube refused the extraction even with a PO token (IP block). Retrying will not help.'
+      : blocked
+        ? 'YouTube refused the extraction (bot check) before a PO token was generated.'
+        : noAudio
+          ? 'yt-dlp produced no playable audio for this track.'
+          : 'yt-dlp exited before producing any audio.';
 
     return new BotError(message, {
-      code: blocked ? 'MUSIC_YOUTUBE_BLOCKED' : noAudio ? 'MUSIC_YTDLP_NO_AUDIO' : 'MUSIC_YTDLP_EXITED',
+      code: ipBlocked
+        ? 'MUSIC_YOUTUBE_IP_BLOCKED'
+        : blocked
+          ? 'MUSIC_YOUTUBE_BLOCKED'
+          : noAudio
+            ? 'MUSIC_YTDLP_NO_AUDIO'
+            : 'MUSIC_YTDLP_EXITED',
       details: this.#stderrDetails(diagnostics),
     });
   }
@@ -726,6 +798,9 @@ export async function createStreamBackend({ settings = {}, logger = null, spawnI
         serverHome: settings.potServerHome,
         playerClient: settings.potPlayerClient,
       }),
+      // Verbose only when a provider is in use: watching the token flow is the
+      // reason, and a plain run keeps its quiet, warning-free output.
+      diagnostics: pot.enabled,
       logger,
     }),
     detection,

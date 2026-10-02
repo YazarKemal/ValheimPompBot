@@ -9,18 +9,23 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   buildExtractorArgs,
+  createPotDiagnostics,
   DEFAULT_POT_PLAYER_CLIENT,
   DEFAULT_POT_SERVER_HOME,
   POT_PLUGIN_MODULE,
   POT_PROVIDER_BGUTIL_SCRIPT,
   POT_PROVIDER_NONE,
   POT_UNAVAILABLE_CODE,
+  potDiagnosticsSummary,
+  scanPotDiagnostics,
   verifyPotProvider,
 } from '../src/music/sources/pot-provider.js';
 import { buildArguments, createStreamBackend, YtDlpStreamBackend, isYoutubeBlocked } from '../src/music/sources/ytdlp.js';
+import { ENV_SCHEMA } from '../src/config/schema.js';
 import { YouTubeSource } from '../src/music/sources/youtube.js';
 import { createMusicService } from '../src/music/index.js';
 import { createCapturingLogger, createNullLogger } from '../src/utils/logger.js';
+import { safeErrorDetails } from '../src/utils/errors.js';
 
 /**
  * The YouTube PO token provider.
@@ -189,11 +194,33 @@ test('the extractor arguments contain no credential of any kind', () => {
 /* The yt-dlp arguments are the documented ones                                */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * The `youtube:` argument, split into its `;`-separated settings.
+ *
+ * Also asserts there is exactly ONE such argument, because yt-dlp REPLACES the
+ * value stored for an extractor key instead of merging into it: a second
+ * `youtube:` argument would silently discard the first.
+ */
+function youtubeSettings(extractorArgs) {
+  const youtubeArgs = extractorArgs.filter((value) => value.startsWith('youtube:'));
+  assert.equal(youtubeArgs.length, 1, 'a second youtube: argument would replace the first, not merge with it');
+
+  return new Map(
+    youtubeArgs[0]
+      .slice('youtube:'.length)
+      .split(';')
+      .map((pair) => {
+        const index = pair.indexOf('=');
+        return [pair.slice(0, index), pair.slice(index + 1)];
+      }),
+  );
+}
+
 test('the script provider and server home are passed exactly as documented', () => {
   const args = buildExtractorArgs({ provider: POT_PROVIDER_BGUTIL_SCRIPT, serverHome: '/opt/x/server' });
 
   assert.deepEqual(args, [
-    `youtube:player_client=${DEFAULT_POT_PLAYER_CLIENT}`,
+    `youtube:player_client=${DEFAULT_POT_PLAYER_CLIENT};pot_trace=true`,
     'youtubepot-bgutilscript:server_home=/opt/x/server',
   ]);
 });
@@ -208,7 +235,62 @@ test('the provider argument prefix and option names are the real ones', async ()
   assert.ok(args.some((arg) => arg.startsWith('youtubepot-bgutilscript:')), 'the provider prefix is wrong');
   assert.ok(args.some((arg) => arg.includes('server_home=')), 'the option is not server_home');
   assert.ok(!args.some((arg) => arg.includes('script_path=')), 'script_path was invented; the plugin reads server_home');
-  assert.ok(args.some((arg) => arg === 'youtube:player_client=mweb'), 'the YouTube player client argument is wrong');
+  assert.equal(
+    youtubeSettings(args).get('player_client'),
+    DEFAULT_POT_PLAYER_CLIENT,
+    'the YouTube player client argument is wrong',
+  );
+});
+
+test('the client list is exactly mweb,tv,web_safari', () => {
+  // One client is not enough: a client can fail with LOGIN_REQUIRED before the
+  // token flow is reached, and then no token is ever requested. The list is the
+  // documented fallback, in the documented order, and yt-dlp splits it on
+  // commas.
+  assert.equal(DEFAULT_POT_PLAYER_CLIENT, 'mweb,tv,web_safari');
+
+  const settings = youtubeSettings(buildExtractorArgs({ provider: POT_PROVIDER_BGUTIL_SCRIPT }));
+  const clients = settings.get('player_client').split(',');
+
+  assert.deepEqual(clients, ['mweb', 'tv', 'web_safari'], 'the client list, in the order yt-dlp should try them');
+  assert.ok(!settings.get('player_client').includes(' '), 'a space would make yt-dlp read the list as one client name');
+});
+
+test('a token is only counted when a response line says one was obtained', () => {
+  // The line printed just before a cache lookup reads "Attempting to fetch PO
+  // Token response from ... cache provider": similar wording, and no token has
+  // been obtained at that point. Counting it would turn "the token flow never
+  // ran" into a confident, wrong "the IP is blocked".
+  const attempt = createPotDiagnostics();
+  assert.deepEqual(
+    scanPotDiagnostics('[debug] [pot] TRACE: Attempting to fetch PO Token response from "memory" cache provider\n', attempt),
+    [],
+  );
+  assert.equal(potDiagnosticsSummary(attempt).potAvailable, false);
+
+  // The real response line, in the shape the pinned yt-dlp prints it.
+  const response = createPotDiagnostics();
+  assert.deepEqual(
+    scanPotDiagnostics(
+      '[debug] [pot] TRACE: PO Token response from "bgutil:script-node" provider: PoTokenResponse(' +
+        "po_token='SECRET1234567890', expires_at=1)\n",
+      response,
+    ),
+    ['tokenGenerated'],
+  );
+  assert.equal(potDiagnosticsSummary(response).potAvailable, true);
+});
+
+test('the cache-provider list is not mistaken for the token-provider list', () => {
+  // The two lines differ by one prefix: `[pot]` versus `[pot:cache]`. A cache
+  // provider being registered says nothing about a token provider existing.
+  const state = createPotDiagnostics();
+
+  assert.deepEqual(scanPotDiagnostics('[debug] [pot:cache] PO Token Cache Providers: memory\n', state), []);
+  assert.equal(potDiagnosticsSummary(state).potProviderLoaded, false);
+
+  assert.deepEqual(scanPotDiagnostics('[debug] [pot] PO Token Providers: memory\n', state), []);
+  assert.equal(potDiagnosticsSummary(state).potProviderLoaded, false, 'a non-bgutil provider was reported as bgutil');
 });
 
 test('the YouTube client is only set together with a provider that can supply its token', () => {
@@ -216,6 +298,42 @@ test('the YouTube client is only set together with a provider that can supply it
   // asking for mweb without a provider is worse than asking for nothing.
   assert.deepEqual(buildExtractorArgs({ provider: POT_PROVIDER_NONE }), []);
   assert.deepEqual(buildExtractorArgs({}), [], 'a default run must stay a plain run');
+});
+
+test('pot_trace is on, because without it a generated token leaves no evidence', () => {
+  // The two lines that prove a token was obtained are printed at TRACE, one
+  // level BELOW the DEBUG that --verbose reaches, so they appear only when
+  // `pot_trace=true` is set. Without it a token can be generated perfectly and
+  // the output looks identical to "the token flow never ran" - which is the
+  // difference between "try another client" and "this address is blocked".
+  const traced = youtubeSettings(buildExtractorArgs({ provider: POT_PROVIDER_BGUTIL_SCRIPT }));
+  assert.equal(traced.get('pot_trace'), 'true');
+  assert.equal(traced.get('player_client'), 'mweb,tv,web_safari', 'the client list must survive alongside it');
+
+  // Still expressible without it, for a caller that only wants the provider list.
+  const untraced = youtubeSettings(buildExtractorArgs({ provider: POT_PROVIDER_BGUTIL_SCRIPT, potTrace: false }));
+  assert.equal(untraced.get('pot_trace'), undefined);
+  assert.equal(untraced.get('player_client'), 'mweb,tv,web_safari');
+});
+
+test('no provider means no pot_trace either', () => {
+  // The argument is part of the provider integration, not a global switch: a
+  // plain run keeps exactly the command line it had before.
+  assert.deepEqual(buildExtractorArgs({ provider: POT_PROVIDER_NONE, potTrace: true }), []);
+});
+
+test('the configured default is the same client list, so the two cannot drift', () => {
+  // `buildExtractorArgs` has its own default, but the value that actually
+  // reaches it in production comes from the config schema when
+  // POMPMUSIC_YTDLP_PLAYER_CLIENT is unset - which is how the image ships,
+  // since the Dockerfile sets the provider but not this. The two defaults
+  // saying different things is a silent regression: the argument is still
+  // well-formed, and only the client list is wrong.
+  const entry = ENV_SCHEMA.find((item) => item.key === 'POMPMUSIC_YTDLP_PLAYER_CLIENT');
+
+  assert.ok(entry, 'the player client setting is gone from the schema');
+  assert.equal(entry.default, DEFAULT_POT_PLAYER_CLIENT);
+  assert.equal(entry.default, 'mweb,tv,web_safari');
 });
 
 test('the arguments reach the spawned command as --extractor-args pairs', () => {
@@ -373,7 +491,7 @@ test('a ready provider logs exactly the three promised facts', async () => {
     assert.match(output, /provider: 'bgutil'/);
     assert.match(output, /mode: 'script'/);
     assert.deepEqual(backend.extractorArgs, [
-      `youtube:player_client=${DEFAULT_POT_PLAYER_CLIENT}`,
+      `youtube:player_client=${DEFAULT_POT_PLAYER_CLIENT};pot_trace=true`,
       `youtubepot-bgutilscript:server_home=${home}`,
     ]);
   });
@@ -464,8 +582,219 @@ test('a bot check is classified as YouTube blocking, not as a broken track', asy
     (failure) => failure,
   );
 
-  assert.equal(error?.code, 'MUSIC_YOUTUBE_BLOCKED');
-  assert.match(error.message, /PO token provider/);
+  assert.equal(error?.code, 'MUSIC_YOUTUBE_BLOCKED', 'a block with no token generated is not an IP block');
+  assert.match(error.message, /before a PO token was generated/);
+  assert.equal(error.details.potAvailable, false);
+});
+
+/* -------------------------------------------------------------------------- */
+/* The token flow, as facts                                                    */
+/* -------------------------------------------------------------------------- */
+
+/** A stream child whose stderr is scripted, line by line. */
+function streamChildWithStderr(lines, { exitCode = 1 } = {}) {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => true;
+  setImmediate(() => {
+    child.emit('spawn');
+    setImmediate(() => {
+      for (const line of lines) child.stderr.write(`${line}\n`);
+      setImmediate(() => child.emit('close', exitCode, null));
+    });
+  });
+  return child;
+}
+
+const BOT_CHECK = "ERROR: [youtube] abc: Sign in to confirm you're not a bot.";
+
+/**
+ * A realistic slice of what yt-dlp prints once a token is in play.
+ *
+ * Copied from the pinned yt-dlp (2026.8.19) rather than imagined, because the
+ * LEVELS are the whole reason `pot_trace=true` is passed: the provider list is
+ * a DEBUG line from `pot/_director.py`, the response lines are TRACE lines from
+ * the same file, and `--verbose` alone stops one level short of them.
+ */
+const TOKEN_FLOW = [
+  '[debug] [pot] PO Token Providers: bgutil:script-node-2.0.1 (external)',
+  '[debug] [pot] PO Token Cache Providers: memory',
+  '[pot:bgutil:script-node] Generating a gvs PO Token for tv client via bgutil script',
+  '[debug] [pot] TRACE: PO Token response from "bgutil:script-node" provider: PoTokenResponse(' +
+    "po_token='SECRETTOKENVALUE1234567890', expires_at=1759999999)",
+];
+
+test('the token flow is detected from the messages yt-dlp actually prints', async () => {
+  const { logger, text } = createCapturingLogger({ level: 'debug' });
+  const spawnImpl = () => streamChildWithStderr([...TOKEN_FLOW, BOT_CHECK]);
+  const backend = new YtDlpStreamBackend({ executable: 'yt-dlp', spawnImpl, maxAttempts: 1, diagnostics: true, logger });
+
+  const error = await backend.openStream(LIVE_URL).then(
+    () => null,
+    (failure) => failure,
+  );
+
+  assert.equal(error.details.potProviderLoaded, true, 'the provider was loaded but not reported');
+  assert.equal(error.details.potGenerationRequested, true);
+  assert.equal(error.details.potAvailable, true, 'a generated token was not recognised');
+  assert.equal(error.details.potClient, 'tv');
+
+  const output = text();
+  assert.match(output, /PO Token provider loaded/);
+  assert.match(output, /PO Token generation requested/);
+  assert.match(output, /PO Token generation succeeded/);
+});
+
+test('the diagnostics survive the logger, rather than redacting themselves', async () => {
+  // The logger masks any value whose KEY looks like a credential. A field named
+  // `potTokenAvailable` was printed as `[redacted]`, which would have hidden
+  // the one fact this whole phase exists to report - so the names are asserted
+  // through a real logger, not just on the object.
+  const { logger, text } = createCapturingLogger({ level: 'debug' });
+  const spawnImpl = () => streamChildWithStderr([...TOKEN_FLOW, BOT_CHECK]);
+  const backend = new YtDlpStreamBackend({ executable: 'yt-dlp', spawnImpl, maxAttempts: 1, diagnostics: true, logger });
+
+  const error = await backend.openStream(LIVE_URL).then(
+    () => null,
+    (failure) => failure,
+  );
+
+  // Logged the way a session logs it: message plus the safe details.
+  logger.warn('Failed to start a track; skipping.', { code: error.code, ...safeErrorDetails(error) });
+
+  const output = text();
+  assert.match(output, /potProviderLoaded: true/, 'the loaded flag was redacted or lost');
+  assert.match(output, /potGenerationRequested: true/, 'the generation flag was redacted or lost');
+  assert.match(output, /potAvailable: true/, 'the availability flag was redacted or lost');
+  assert.ok(!output.includes('potAvailable: \[redacted\]'), 'a diagnostic redacted itself');
+  assert.match(output, /potClient: 'tv'/);
+});
+
+test('the diagnostic never contains the token, in the log or the error', async () => {
+  const { logger, text } = createCapturingLogger({ level: 'debug' });
+  const spawnImpl = () => streamChildWithStderr([...TOKEN_FLOW, BOT_CHECK]);
+  const backend = new YtDlpStreamBackend({ executable: 'yt-dlp', spawnImpl, maxAttempts: 1, diagnostics: true, logger });
+
+  const error = await backend.openStream(LIVE_URL).then(
+    () => null,
+    (failure) => failure,
+  );
+
+  const logged = text();
+  assert.ok(!logged.includes('SECRETTOKENVALUE1234567890'), 'the token reached the log');
+  assert.ok(
+    !JSON.stringify(error.details).includes('SECRETTOKENVALUE1234567890'),
+    'the token reached the error details',
+  );
+  // The captured stderr is the one place a token could escape, because yt-dlp
+  // prints the whole response at debug level. It is masked there too.
+  assert.match(error.details.stderr, /po_token=\[redacted\]/, 'the token was not masked in the captured stderr');
+  assert.match(error.details.stderr, /expires_at=1759999999/, 'the harmless part of the response was lost');
+});
+
+test('a block WITHOUT a token request is distinguished from one with', async () => {
+  // The client failed before the token flow: no "Generating" line at all. This
+  // is the case another client can fix.
+  const silentFlow = ['[debug] [pot] PO Token Providers: bgutil:script-node-2.0.1 (external)', BOT_CHECK];
+  const spawnImpl = () => streamChildWithStderr(silentFlow);
+  const backend = new YtDlpStreamBackend({ executable: 'yt-dlp', spawnImpl, maxAttempts: 1, diagnostics: true, logger: createNullLogger() });
+
+  const error = await backend.openStream(LIVE_URL).then(
+    () => null,
+    (failure) => failure,
+  );
+
+  assert.equal(error.code, 'MUSIC_YOUTUBE_BLOCKED');
+  assert.equal(error.details.potProviderLoaded, true);
+  assert.equal(error.details.potGenerationRequested, false, 'a token request was reported that never happened');
+  assert.equal(error.details.potAvailable, false);
+});
+
+test('a block AFTER a token was generated is an IP block, and is not retried', async () => {
+  let spawns = 0;
+  const spawnImpl = () => {
+    spawns += 1;
+    return streamChildWithStderr([...TOKEN_FLOW, BOT_CHECK]);
+  };
+  const backend = new YtDlpStreamBackend({
+    executable: 'yt-dlp',
+    spawnImpl,
+    maxAttempts: 3,
+    retryDelayMs: 0,
+    diagnostics: true,
+    logger: createNullLogger(),
+  });
+
+  const error = await backend.openStream(LIVE_URL).then(
+    () => null,
+    (failure) => failure,
+  );
+
+  assert.equal(error.code, 'MUSIC_YOUTUBE_IP_BLOCKED', 'a post-token block must be classified as an IP block');
+  assert.match(error.message, /IP block/);
+  assert.equal(spawns, 1, 'an IP block was retried; it cannot succeed');
+});
+
+test('a token served from the yt-dlp cache also counts as available', async () => {
+  // The memory cache means only the first track generates a token; later tracks
+  // reuse it. Those must not be mistaken for "no token was requested".
+  const cachedFlow = [
+    '[debug] [pot] PO Token Providers: bgutil:script-node-2.0.1 (external)',
+    '[debug] [pot:cache] TRACE: PO Token response retrieved from cache using "memory" provider: ' +
+      "PoTokenResponse(po_token='CACHEDSECRET1234567890')",
+    BOT_CHECK,
+  ];
+  const spawnImpl = () => streamChildWithStderr(cachedFlow);
+  const backend = new YtDlpStreamBackend({ executable: 'yt-dlp', spawnImpl, maxAttempts: 1, diagnostics: true, logger: createNullLogger() });
+
+  const error = await backend.openStream(LIVE_URL).then(
+    () => null,
+    (failure) => failure,
+  );
+
+  assert.equal(error.code, 'MUSIC_YOUTUBE_IP_BLOCKED');
+  assert.equal(error.details.potAvailable, true);
+  assert.ok(!JSON.stringify(error.details).includes('CACHEDSECRET'), 'a cached token reached the error details');
+});
+
+test('a marker split across two reads is still recognised', () => {
+  const state = createPotDiagnostics();
+
+  // Exactly what a chunk boundary does to a line.
+  assert.deepEqual(scanPotDiagnostics('[debug] [pot] PO Token Prov', state), []);
+  assert.deepEqual(scanPotDiagnostics('iders: bgutil:script-node-2.0.1 (external)\n', state), ['providerLoaded']);
+  assert.equal(state.providerLoaded, true);
+});
+
+test('each fact is reported once, however often it is printed', () => {
+  const state = createPotDiagnostics();
+  const line = '[pot:bgutil:script-node] Generating a gvs PO Token for mweb client via bgutil script\n';
+
+  assert.deepEqual(scanPotDiagnostics(line, state), ['generationRequested']);
+  assert.deepEqual(scanPotDiagnostics(line, state), [], 'the same fact was reported twice');
+  assert.equal(state.client, 'mweb');
+});
+
+test('a provider list without bgutil is not reported as loaded', () => {
+  const state = createPotDiagnostics();
+
+  assert.deepEqual(scanPotDiagnostics('[debug] [pot] PO Token Providers: none\n', state), []);
+  assert.equal(state.providerLoaded, false, 'a loaded provider was claimed when there is none');
+  assert.equal(potDiagnosticsSummary(state).potProviderLoaded, false);
+});
+
+test('verbose output stays out of a plain run', () => {
+  // The diagnostics exist to watch the token flow; a run without a provider
+  // keeps exactly the arguments it had before.
+  assert.ok(!buildArguments({ url: LIVE_URL }).includes('--verbose'));
+  assert.ok(buildArguments({ url: LIVE_URL }).includes('--no-warnings'));
+  assert.ok(!buildArguments({ url: LIVE_URL, diagnostics: false }).includes('--verbose'));
+
+  const withDiagnostics = buildArguments({ url: LIVE_URL, diagnostics: true });
+  assert.ok(withDiagnostics.includes('--verbose'), 'the token flow would be invisible');
+  assert.ok(!withDiagnostics.includes('--no-warnings'), 'the "no PO token was provided" warning would be suppressed');
+  assert.equal(withDiagnostics.at(-1), LIVE_URL, 'the url is no longer last');
 });
 
 test('the blocked patterns are the ones YouTube actually sends', () => {
