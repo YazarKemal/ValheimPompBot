@@ -13,6 +13,7 @@ import {
   resolvePort,
 } from '../src/health/server.js';
 import { createCapturingLogger } from '../src/utils/logger.js';
+import { fakeDiscordToken, fakeApiKey } from './helpers/fake-secrets.js';
 
 /**
  * The HTTP health endpoint.
@@ -110,9 +111,11 @@ test('uptime never goes negative when the clock steps backwards', () => {
 test('the payload carries no secret and no identifier', () => {
   // Planted the way a leak would actually happen: a value that reached the
   // process through the environment.
+  // Token- and key-SHAPED, assembled at runtime so the repository text never
+  // contains a credential-shaped literal. See tests/helpers/fake-secrets.js.
   const secrets = {
-    DISCORD_TOKEN: 'MTIzNDU2Nzg5MDEyMzQ1Njc4.Gh1jKl.averysecrettokenvaluethatmustnotappear',
-    AI_API_KEY: 'sk-deepseek-secret-key-value',
+    DISCORD_TOKEN: fakeDiscordToken(),
+    AI_API_KEY: fakeApiKey(),
     ITAD_API_KEY: 'itad-secret-key',
     POMPMUSIC_TOKEN: 'pompmusic-secret-token',
     DISCORD_GUILD_ID: '123456789012345678',
