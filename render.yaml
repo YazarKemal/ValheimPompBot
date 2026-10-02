@@ -1,0 +1,82 @@
+# Render blueprint for PompBots.
+#
+# One web service running one process: PompAI, PompMusic, the giveaway monitor
+# and the fun economy all live in it. Music is why this is a Docker service -
+# the image installs yt-dlp, which no buildpack would do for us.
+#
+# NO SECRETS IN THIS FILE. Every credential uses `sync: false`, which tells
+# Render to prompt for the value in the dashboard and keep it out of the
+# repository. Names are documented in docs/render-env.md.
+
+services:
+  - type: web
+    name: pomp-bots
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    # Closest region to the server's members. Change it if that is wrong.
+    region: frankfurt
+    # Render probes this to decide whether the deploy succeeded. The endpoint
+    # answers before Discord connects, so a slow gateway does not fail it.
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # -- Deployment ------------------------------------------------------
+      # Tells the process to expect an ephemeral filesystem, which is what
+      # turns on the startup warning about losing runtime state.
+      - key: DEPLOY_PLATFORM
+        value: render
+      # Without this the process configures itself and exits, and Render would
+      # report a healthy service that never connects to Discord.
+      - key: BOT_CONNECT
+        value: "true"
+      # Server structure is applied by hand, deliberately, never on boot.
+      - key: DRY_RUN
+        value: "true"
+      - key: LOG_LEVEL
+        value: info
+      - key: BOT_ENV
+        value: production
+      # Mount point of a Render disk, if one is ever attached. Left empty the
+      # process warns at startup that the economy is on ephemeral storage.
+      - key: PERSISTENT_STORAGE_PATH
+        value: ""
+
+      # -- Music -----------------------------------------------------------
+      # No play-dl fallback: yt-dlp is in the image and is the only backend.
+      - key: POMPMUSIC_STREAM_BACKEND
+        value: ytdlp
+      - key: POMPMUSIC_ENABLED
+        value: "true"
+
+      # -- Secrets: set in the dashboard, never here ------------------------
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DISCORD_CLIENT_ID
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: POMPMUSIC_TOKEN
+        sync: false
+      - key: POMPMUSIC_CLIENT_ID
+        sync: false
+      - key: AI_API_KEY
+        sync: false
+      - key: ITAD_API_KEY
+        sync: false
+
+      # -- Non-secret values that depend on the server ----------------------
+      - key: DISCORD_EXPECTED_GUILD_NAME
+        sync: false
+      - key: AI_PROVIDER
+        sync: false
+      - key: AI_MODEL
+        sync: false
+      - key: AI_RESPONSE_VISIBILITY
+        sync: false
+      - key: FREE_GAMES_ENABLED
+        sync: false
+      - key: STEAM_GIVEAWAY_SOURCE
+        sync: false
+      - key: FUN_MESSAGE_XP_ENABLED
+        sync: false

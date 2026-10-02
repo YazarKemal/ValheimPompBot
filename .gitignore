@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Secrets - never commit real credentials.
+# .env.example IS tracked and must contain placeholders only.
+.env
+.env.*
+!.env.example
+
+# Guild snapshots describe a private server; keep them out of the repo
+snapshots/
+snapshot-*.json
+
+# Runtime state (which giveaways have already been announced)
+data/
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-error.log*
+
+# Test / build output
+coverage/
+dist/
+*.tsbuildinfo
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

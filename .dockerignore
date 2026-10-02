@@ -1,0 +1,29 @@
+# Keep secrets and local state out of the image. `.env` in particular must
+# never be baked into a layer: anyone who can pull the image can read it.
+.env
+.env.*
+!.env.example
+
+# Runtime state is written by the running container, never shipped into it.
+# A local SQLite file or giveaway ledger in the image would be stale at best.
+data/
+snapshots/
+snapshot-*.json
+
+# Dependencies are installed inside the image by `npm ci`, so the host's copy
+# is both redundant and possibly built for the wrong platform.
+node_modules/
+
+# Version control and editor noise.
+.git/
+.gitignore
+.github/
+.idea/
+.vscode/
+*.swp
+
+# Local output that has no business in a deployment.
+coverage/
+logs/
+*.log
+npm-debug.log*

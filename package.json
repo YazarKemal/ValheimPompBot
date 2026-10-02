@@ -1,0 +1,37 @@
+{
+  "name": "valheim-pomp-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Discord bot foundation for the Valheim Pomp server: modular bootstrap, idempotent setup planner, and provider-agnostic AI layer.",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "//": "Node 24 is a floor, not a preference: node:sqlite - which the fun economy is built on - is only available WITHOUT a flag from Node 24.",
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "start:render": "node scripts/start-render.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test \"tests/**/*.test.js\"",
+    "check": "node scripts/check.js",
+    "snapshot": "node src/setup/snapshot-cli.js",
+    "deploy:commands": "node src/deploy/cli.js",
+    "setup:plan": "node src/setup/cli.js",
+    "setup:apply": "node src/setup/cli.js --apply",
+    "deploy:music-commands": "node src/deploy/cli.js --owner pompmusic"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "valheim"
+  ],
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@discordjs/voice": "^0.19.2",
+    "discord.js": "^14.27.0",
+    "dotenv": "^18.0.5",
+    "libsodium-wrappers": "^0.8.4",
+    "play-dl": "^1.9.7"
+  }
+}
